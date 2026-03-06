@@ -1,4 +1,7 @@
-from flask import Flask, render_template_string, request, jsonify
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, flash
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from datetime import datetime, timedelta
 import torch
 import numpy as np
 from transformers import AutoFeatureExtractor, AutoModel
@@ -9,39 +12,65 @@ import os
 import uuid
 import joblib
 import io
-import base64
-from werkzeug.utils import secure_filename
 import logging
+from functools import wraps
+import secrets
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key'
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
+app.config['SECRET_KEY'] = secrets.token_hex(32)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///aau_ml.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024
+app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
+app.config['MODEL_FOLDER'] = '/tmp/models'
+app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=2)
 
-# Use /tmp for all file operations (Hugging Face compatible)
-UPLOAD_FOLDER = '/tmp/uploads'
-CACHE_DIR = '/tmp/model_cache'
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['MODEL_FOLDER'], exist_ok=True)
 
+# Database
+db = SQLAlchemy(app)
+
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    student_id = db.Column(db.String(20), unique=True, nullable=False)
+    email = db.Column(db.String(100), unique=True, nullable=False)
+    full_name = db.Column(db.String(100), nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+with app.app_context():
+    db.create_all()
+
+def login_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if 'user_id' not in session:
+            return jsonify({'error': 'Authentication required'}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+# ML Model Class
 class SupervisedDeepBoostingClassifier:
     def __init__(self, model_name="google/vit-base-patch16-224"):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        logger.info(f"Using device: {self.device}")
-        
-        # Use cache_dir to avoid re-downloading
         logger.info(f"Loading model {model_name}...")
         try:
             self.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                model_name, 
-                cache_dir=CACHE_DIR
+                model_name, cache_dir='/tmp/model_cache'
             )
             self.deep_model = AutoModel.from_pretrained(
-                model_name, 
-                cache_dir=CACHE_DIR
+                model_name, cache_dir='/tmp/model_cache'
             ).to(self.device)
             self.deep_model.eval()
             logger.info("Model loaded successfully!")
@@ -49,28 +78,20 @@ class SupervisedDeepBoostingClassifier:
             logger.error(f"Failed to load model: {e}")
             raise
         
-        self.booster = None  # Store the XGBoost booster directly
+        self.booster = None
         self.label_encoder = LabelEncoder()
         self.classes = []
         self.is_trained = False
     
     def extract_deep_features(self, image_data):
-        """Extract features from image bytes or PIL Image"""
         try:
             if isinstance(image_data, str):
-                # It's a file path
-                if not os.path.exists(image_data):
-                    logger.error(f"File not found: {image_data}")
-                    return None
                 image = Image.open(image_data).convert('RGB')
             elif isinstance(image_data, bytes):
-                # It's bytes
                 image = Image.open(io.BytesIO(image_data)).convert('RGB')
             else:
-                # Assume it's a PIL Image
                 image = image_data.convert('RGB')
             
-            # Resize image if needed (ViT expects 224x224)
             if image.size != (224, 224):
                 image = image.resize((224, 224))
             
@@ -84,54 +105,33 @@ class SupervisedDeepBoostingClassifier:
             return features.cpu().numpy().flatten()
         except Exception as e:
             logger.error(f"Feature extraction error: {e}")
-            import traceback
-            traceback.print_exc()
             return None
     
-    def train_supervised(self, image_data_list, labels):
-        logger.info(f"Training started with {len(image_data_list)} images...")
-        
-        if len(image_data_list) < 2:
-            raise ValueError(f"Need at least 2 images for training. Got {len(image_data_list)}")
+    def train(self, image_data_list, labels):
+        logger.info(f"Training with {len(image_data_list)} images...")
         
         features = []
         valid_labels = []
         
-        for i, (img_data, label) in enumerate(zip(image_data_list, labels)):
-            logger.info(f"Processing image {i+1}/{len(image_data_list)} with label: {label}")
+        for img_data, label in zip(image_data_list, labels):
             feat = self.extract_deep_features(img_data)
             if feat is not None:
                 features.append(feat)
                 valid_labels.append(label)
-                logger.info(f"✓ Successfully processed: {label}")
-            else:
-                logger.error(f"✗ Failed to process image {i+1}")
         
         if len(features) < 2:
-            raise ValueError(f"Need at least 2 valid images for training. Got {len(features)}")
+            raise ValueError(f"Need at least 2 valid images. Got {len(features)}")
         
         unique_classes = set(valid_labels)
-        logger.info(f"Unique classes detected: {unique_classes}")
-        
         if len(unique_classes) < 2:
             raise ValueError(f"Need at least 2 different classes. Got: {unique_classes}")
         
         X = np.array(features)
-        logger.info(f"Feature matrix shape: {X.shape}")
-        
         y = self.label_encoder.fit_transform(valid_labels)
         self.classes = self.label_encoder.classes_
         num_classes = len(self.classes)
-        logger.info(f"Encoded labels: {y}")
-        logger.info(f"Classes: {self.classes}, num_classes: {num_classes}")
         
-        # Use XGBoost native API
-        logger.info(f"Training XGBoost classifier with native API...")
-        
-        # Convert to DMatrix for native API
         dtrain = xgb.DMatrix(X, label=y)
-        
-        # Set parameters explicitly
         params = {
             'objective': 'multi:softprob',
             'num_class': num_classes,
@@ -143,17 +143,13 @@ class SupervisedDeepBoostingClassifier:
             'seed': 42
         }
         
-        # Train the model and store booster directly
         self.booster = xgb.train(params, dtrain, num_boost_round=200)
         
-        # Make predictions for accuracy calculation
         train_pred_proba = self.booster.predict(dtrain)
         train_pred = np.argmax(train_pred_proba, axis=1)
         accuracy = np.mean(train_pred == y)
-        logger.info(f"Training accuracy: {accuracy:.4f}")
         
         self.is_trained = True
-        
         return {
             'accuracy': float(accuracy),
             'samples': len(features),
@@ -162,7 +158,6 @@ class SupervisedDeepBoostingClassifier:
     
     def predict(self, image_data, top_k=3):
         if not self.is_trained or self.booster is None:
-            logger.warning("Model not trained yet")
             return [{'class': 'Model not trained', 'confidence': 0, 'probability': '0%'}]
         
         features = self.extract_deep_features(image_data)
@@ -170,403 +165,679 @@ class SupervisedDeepBoostingClassifier:
             return [{'class': 'Error extracting features', 'confidence': 0, 'probability': '0%'}]
         
         features = features.reshape(1, -1)
-        logger.info(f"Feature shape for prediction: {features.shape}")
-        
-        # Use the booster directly for prediction
         dtest = xgb.DMatrix(features)
         probabilities = self.booster.predict(dtest)[0]
         
-        logger.info(f"Raw probabilities: {probabilities}")
-        logger.info(f"Classes: {self.classes}")
-        
-        # Ensure probabilities sum to 1 (they should, but just in case)
-        if np.sum(probabilities) > 0:
-            probabilities = probabilities / np.sum(probabilities)
-        
-        # Get top k predictions
+        probabilities = probabilities / np.sum(probabilities)
         top_indices = np.argsort(probabilities)[-top_k:][::-1]
         
         predictions = []
         for idx in top_indices:
-            confidence = float(probabilities[idx])
             predictions.append({
                 'class': self.classes[idx],
-                'confidence': confidence,
-                'probability': f"{confidence:.2%}"
+                'probability': f"{probabilities[idx]:.2%}"
             })
         
-        logger.info(f"Final predictions: {predictions}")
         return predictions
-    
-    def save(self, path='/tmp/model.pkl'):
-        if self.booster is not None:
-            joblib.dump({
-                'booster': self.booster,
-                'encoder': self.label_encoder,
-                'classes': self.classes,
-                'is_trained': self.is_trained
-            }, path)
-            logger.info(f"Model saved to {path}")
-    
-    def load(self, path='/tmp/model.pkl'):
-        if os.path.exists(path):
-            data = joblib.load(path)
-            self.booster = data['booster']
-            self.label_encoder = data['encoder']
-            self.classes = data['classes']
-            self.is_trained = data['is_trained']
-            logger.info(f"Model loaded from {path}")
-            return True
-        return False
 
 # Initialize model
-logger.info("Initializing model...")
 model = SupervisedDeepBoostingClassifier()
-model.load()
-logger.info("Ready!")
 
-HTML = """<!DOCTYPE html>
+# HTML Templates
+BASE_TEMPLATE = """
+<!DOCTYPE html>
 <html>
 <head>
-    <title>ML Image Classifier</title>
+    <title>AAU ML Image Classifier</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
-        body { font-family: Arial; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
-        .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; border-radius: 10px; margin-bottom: 30px; text-align: center; }
-        .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }
-        .upload-area { border: 3px dashed #ddd; padding: 40px; text-align: center; border-radius: 10px; margin: 20px 0; cursor: pointer; }
-        .upload-area:hover { border-color: #667eea; }
-        .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; width: 100%; margin: 10px 0; font-size: 16px; }
-        .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
-        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        .result-item { display: flex; justify-content: space-between; padding: 10px; background: #f0f0f0; margin: 5px 0; border-radius: 5px; }
-        .image-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; background: #f9f9f9; padding: 10px; border-radius: 5px; }
-        #preview { max-width: 100%; max-height: 200px; display: none; margin: 10px 0; border-radius: 5px; }
-        .status { background: #e3f2fd; padding: 15px; border-radius: 5px; margin: 10px 0; }
-        .loading { text-align: center; padding: 20px; }
-        .loading-spinner { display: inline-block; width: 20px; height: 20px; border: 3px solid #f3f3f3; border-top: 3px solid #667eea; border-radius: 50%; animation: spin 1s linear infinite; margin-right: 10px; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+            min-height: 100vh;
+        }
+        .aau-header {
+            background: linear-gradient(135deg, #002B5C 0%, #1a4a7a 100%);
+            color: white;
+            padding: 1.5rem;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+        }
+        .aau-header h1 {
+            font-size: 2.2rem;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+        .aau-header h2 {
+            font-size: 1.2rem;
+            font-weight: 400;
+            opacity: 0.9;
+        }
+        .aau-header .program {
+            background: rgba(255,255,255,0.2);
+            display: inline-block;
+            padding: 0.5rem 1.5rem;
+            border-radius: 50px;
+            margin-top: 1rem;
+            font-size: 0.9rem;
+            letter-spacing: 1px;
+        }
+        .aau-footer {
+            background: #002B5C;
+            color: white;
+            text-align: center;
+            padding: 1.5rem;
+            margin-top: 2rem;
+            font-size: 0.9rem;
+        }
+        .container {
+            max-width: 1400px;
+            margin: 2rem auto;
+            padding: 0 2rem;
+        }
+        .auth-container {
+            max-width: 400px;
+            margin: 3rem auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+            padding: 2.5rem;
+        }
+        .auth-header {
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+        .auth-header img {
+            width: 80px;
+            margin-bottom: 1rem;
+        }
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: #333;
+            font-weight: 500;
+        }
+        .form-group input {
+            width: 100%;
+            padding: 0.8rem;
+            border: 2px solid #e1e5e9;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s;
+        }
+        .form-group input:focus {
+            border-color: #002B5C;
+            outline: none;
+        }
+        .btn {
+            background: linear-gradient(135deg, #002B5C 0%, #1a4a7a 100%);
+            color: white;
+            border: none;
+            padding: 0.8rem 1.5rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.3s, box-shadow 0.3s;
+            width: 100%;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(0,43,92,0.3);
+        }
+        .btn-secondary {
+            background: #6c757d;
+        }
+        .alert {
+            padding: 1rem;
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+        .alert-success {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .alert-danger {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .alert-warning {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2rem;
+        }
+        .card {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 5px 20px rgba(0,0,0,0.1);
+            padding: 2rem;
+        }
+        .image-row {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            padding: 1rem;
+            background: #f8f9fa;
+            border-radius: 10px;
+            align-items: center;
+        }
+        .result-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 1rem;
+            background: #f8f9fa;
+            margin: 0.5rem 0;
+            border-radius: 8px;
+            border-left: 4px solid #002B5C;
+        }
+        .loading {
+            text-align: center;
+            padding: 2rem;
+        }
+        .loading-spinner {
+            display: inline-block;
+            width: 40px;
+            height: 40px;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #002B5C;
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+        }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .thumbnail { max-width: 50px; max-height: 50px; border-radius: 5px; margin-left: 10px; }
-        .error { background: #ffebee; color: #c62828; padding: 10px; border-radius: 5px; margin: 10px 0; }
-        .success { background: #e8f5e9; color: #2e7d32; padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .thumbnail { max-width: 50px; max-height: 50px; border-radius: 5px; }
+        .status-badge {
+            background: #28a745;
+            color: white;
+            padding: 0.25rem 0.75rem;
+            border-radius: 50px;
+            font-size: 0.8rem;
+            display: inline-block;
+        }
+        @media (max-width: 768px) {
+            .grid-2 { grid-template-columns: 1fr; }
+        }
     </style>
 </head>
 <body>
-    <div class="header">
-        <h1>🎯 ML Image Classifier</h1>
-        <p>Deep Learning (ViT) + XGBoost Boosting</p>
+    <div class="aau-header">
+        <h1>🎯 Addis Ababa University</h1>
+        <h2>College of Natural and Computational Sciences</h2>
+        <div class="program">Department of Computer Science | MSc in Network & Security</div>
     </div>
     
     <div class="container">
-        <div class="card">
-            <h2>📚 Train Model</h2>
-            <p>Upload labeled images <strong>(need at least 2 images with DIFFERENT labels)</strong></p>
-            <div id="imageRows"></div>
-            <button class="btn" onclick="addRow()" id="addBtn">+ Add Image</button>
-            <button class="btn" onclick="trainModel()" id="trainBtn">🚀 Start Training</button>
-            <div id="trainingResult" class="status" style="display:none;"></div>
-        </div>
-        
-        <div class="card">
-            <h2>🎯 Classify Image</h2>
-            <p>Upload image to classify</p>
-            <div class="upload-area" onclick="document.getElementById('fileInput').click()">
-                <input type="file" id="fileInput" accept="image/*" style="display:none;">
-                <p>📸 Click to select image</p>
-            </div>
-            <img id="preview" src="#">
-            <button class="btn" onclick="predictImage()" id="predictBtn">🔍 Classify</button>
-            <div id="predictionResult"></div>
-        </div>
+        {% block content %}{% endblock %}
+    </div>
+    
+    <div class="aau-footer">
+        <p>© 2026 Addis Ababa University | ML Image Classifier | Supervised Learning with ViT + XGBoost</p>
+        <p style="font-size:0.8rem; opacity:0.8; margin-top:0.5rem;">Developed for Research Method Course | All models trained locally on user data</p>
     </div>
     
     <script>
-        let rowCount = 0;
-        
-        function addRow() {
-            const container = document.getElementById('imageRows');
-            const row = document.createElement('div');
-            row.className = 'image-row';
-            row.id = `row_${rowCount}`;
-            row.innerHTML = `
-                <input type="file" accept="image/*" style="flex:2;" onchange="previewImage(this, ${rowCount})" required>
-                <input type="text" id="label_${rowCount}" placeholder="Label (e.g., cat)" style="flex:1;" required>
-                <button onclick="removeRow(${rowCount})" style="background:#f44336; color:white; border:none; padding:5px 10px; border-radius:5px;">✕</button>
-                <img id="preview_${rowCount}" class="thumbnail" style="display:none;">
-            `;
-            container.appendChild(row);
-            rowCount++;
+        function showLoading(elementId) {
+            document.getElementById(elementId).innerHTML = '<div class="loading"><div class="loading-spinner"></div><p style="margin-top:1rem;">Processing...</p></div>';
         }
         
-        function removeRow(id) {
-            const row = document.getElementById(`row_${id}`);
-            if (row) row.remove();
+        function showError(elementId, message) {
+            document.getElementById(elementId).innerHTML = `<div class="alert alert-danger">❌ ${message}</div>`;
         }
         
-        function previewImage(input, rowId) {
-            const file = input.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const preview = document.getElementById(`preview_${rowId}`);
-                    preview.src = e.target.result;
-                    preview.style.display = 'inline';
-                }
-                reader.readAsDataURL(file);
-            }
+        function showSuccess(elementId, message) {
+            document.getElementById(elementId).innerHTML = `<div class="alert alert-success">✅ ${message}</div>`;
         }
-        
-        function validateTrainingData() {
-            const rows = document.querySelectorAll('[id^="row_"]');
-            const labels = new Set();
-            let hasImages = false;
-            
-            for (let row of rows) {
-                const fileInput = row.querySelector('input[type="file"]');
-                const labelInput = row.querySelector('input[type="text"]');
-                
-                if (fileInput.files[0] && labelInput.value) {
-                    hasImages = true;
-                    labels.add(labelInput.value.trim());
-                }
-            }
-            
-            return {
-                isValid: hasImages && labels.size >= 2,
-                numClasses: labels.size,
-                hasImages: hasImages
-            };
-        }
-        
-        async function trainModel() {
-            const validation = validateTrainingData();
-            
-            if (!validation.hasImages) {
-                alert('Please add at least one image with a label');
-                return;
-            }
-            
-            if (validation.numClasses < 2) {
-                alert(`Need at least 2 DIFFERENT classes. You have ${validation.numClasses} class(es). Please add images with different labels (e.g., 'cat' and 'dog')`);
-                return;
-            }
-            
-            const formData = new FormData();
-            const rows = document.querySelectorAll('[id^="row_"]');
-            
-            for (let row of rows) {
-                const fileInput = row.querySelector('input[type="file"]');
-                const labelInput = row.querySelector('input[type="text"]');
-                
-                if (fileInput.files[0] && labelInput.value) {
-                    formData.append('images', fileInput.files[0]);
-                    formData.append('labels', labelInput.value.trim());
-                }
-            }
-            
-            // Disable buttons during training
-            document.getElementById('trainBtn').disabled = true;
-            document.getElementById('addBtn').disabled = true;
-            
-            document.getElementById('trainingResult').style.display = 'block';
-            document.getElementById('trainingResult').innerHTML = '<div class="loading"><span class="loading-spinner"></span>Training in progress... ⏳</div>';
-            
-            try {
-                const response = await fetch('/train', { 
-                    method: 'POST', 
-                    body: formData
-                });
-                
-                const data = await response.json();
-                
-                if (!response.ok) {
-                    throw new Error(data.error || `Server error: ${response.status}`);
-                }
-                
-                if (data.success) {
-                    document.getElementById('trainingResult').innerHTML = `
-                        <div class="success">
-                            ✅ <strong>Training Complete!</strong><br>
-                            Accuracy: ${(data.metrics.accuracy * 100).toFixed(2)}%<br>
-                            Classes: ${data.metrics.classes.join(', ')}<br>
-                            Samples: ${data.metrics.samples}
-                        </div>
-                    `;
-                }
-            } catch (error) {
-                document.getElementById('trainingResult').innerHTML = `
-                    <div class="error">
-                        ❌ <strong>Error:</strong> ${error.message}
-                    </div>
-                `;
-            } finally {
-                // Re-enable buttons
-                document.getElementById('trainBtn').disabled = false;
-                document.getElementById('addBtn').disabled = false;
-            }
-        }
-        
-        document.getElementById('fileInput').addEventListener('change', function(e) {
-            const file = e.target.files[0];
-            if (file) {
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const preview = document.getElementById('preview');
-                    preview.src = e.target.result;
-                    preview.style.display = 'block';
-                }
-                reader.readAsDataURL(file);
-            }
-        });
-        
-        async function predictImage() {
-            const fileInput = document.getElementById('fileInput');
-            if (!fileInput.files[0]) {
-                alert('Please select an image first');
-                return;
-            }
-            
-            const formData = new FormData();
-            formData.append('file', fileInput.files[0]);
-            
-            // Disable predict button
-            document.getElementById('predictBtn').disabled = true;
-            
-            document.getElementById('predictionResult').innerHTML = '<div class="loading"><span class="loading-spinner"></span>Classifying... ⏳</div>';
-            
-            try {
-                const response = await fetch('/predict', { 
-                    method: 'POST', 
-                    body: formData 
-                });
-                
-                const data = await response.json();
-                
-                if (!response.ok) {
-                    throw new Error(data.error || `Server error: ${response.status}`);
-                }
-                
-                if (data.success) {
-                    let html = '<h3>Results:</h3>';
-                    data.predictions.forEach(p => {
-                        html += `<div class="result-item"><span>${p.class}</span><span>${p.probability}</span></div>`;
-                    });
-                    document.getElementById('predictionResult').innerHTML = html;
-                }
-            } catch (error) {
-                document.getElementById('predictionResult').innerHTML = `
-                    <div class="error">
-                        ❌ <strong>Error:</strong> ${error.message}
-                    </div>
-                `;
-            } finally {
-                // Re-enable predict button
-                document.getElementById('predictBtn').disabled = false;
-            }
-        }
-        
-        // Initialize with two rows
-        addRow();
-        addRow();
     </script>
+    {% block scripts %}{% endblock %}
 </body>
-</html>"""
+</html>
+"""
+
+# Index Page
+INDEX_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<div style="text-align: center; padding: 3rem; background: white; border-radius: 20px; box-shadow: 0 10px 30px rgba(0,0,0,0.1);">
+    <h1 style="color: #002B5C; font-size: 2.5rem; margin-bottom: 1.5rem;">🔬 ML Image Classifier</h1>
+    <p style="font-size: 1.2rem; color: #666; margin-bottom: 2rem; max-width: 800px; margin-left: auto; margin-right: auto;">
+        A supervised learning solution combining Vision Transformers (ViT) and XGBoost boosting algorithm
+    </p>
+    
+    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 2rem; margin: 3rem 0;">
+        <div style="padding: 2rem; background: #f8f9fa; border-radius: 15px;">
+            <div style="font-size: 3rem; margin-bottom: 1rem;">🧠</div>
+            <h3>ViT Feature Extraction</h3>
+            <p style="color: #666;">Google's Vision Transformer extracts 768-dimensional features</p>
+        </div>
+        <div style="padding: 2rem; background: #f8f9fa; border-radius: 15px;">
+            <div style="font-size: 3rem; margin-bottom: 1rem;">⚡</div>
+            <h3>XGBoost Classification</h3>
+            <p style="color: #666;">Gradient boosting for accurate multi-class predictions</p>
+        </div>
+        <div style="padding: 2rem; background: #f8f9fa; border-radius: 15px;">
+            <div style="font-size: 3rem; margin-bottom: 1rem;">🔐</div>
+            <h3>Secure Authentication</h3>
+            <p style="color: #666;">Student ID-based access for AAU community</p>
+        </div>
+    </div>
+    
+    <div style="display: flex; gap: 1rem; justify-content: center;">
+        <a href="/login" class="btn" style="width: auto; padding: 1rem 3rem;">🔑 Login</a>
+        <a href="/register" class="btn btn-secondary" style="width: auto; padding: 1rem 3rem;">📝 Register</a>
+    </div>
+</div>
+{% endblock %}
+"""
+
+# Login Page
+LOGIN_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-container">
+    <div class="auth-header">
+        <h2 style="color: #002B5C;">🔐 Student Login</h2>
+        <p style="color: #666; margin-top: 0.5rem;">Access your ML workspace</p>
+    </div>
+    
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="alert alert-{{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+    
+    <form method="POST">
+        <div class="form-group">
+            <label>🎓 Student ID</label>
+            <input type="text" name="student_id" required placeholder="e.g., UGR/1234/12">
+        </div>
+        <div class="form-group">
+            <label>🔑 Password</label>
+            <input type="password" name="password" required>
+        </div>
+        <button type="submit" class="btn">Login</button>
+    </form>
+    
+    <p style="text-align: center; margin-top: 1.5rem;">
+        Don't have an account? <a href="/register" style="color: #002B5C;">Register here</a>
+    </p>
+</div>
+{% endblock %}
+"""
+
+# Register Page
+REGISTER_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-container">
+    <div class="auth-header">
+        <h2 style="color: #002B5C;">📝 Student Registration</h2>
+        <p style="color: #666; margin-top: 0.5rem;">Join the AAU ML community</p>
+    </div>
+    
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            {% for category, message in messages %}
+                <div class="alert alert-{{ category }}">{{ message }}</div>
+            {% endfor %}
+        {% endif %}
+    {% endwith %}
+    
+    <form method="POST">
+        <div class="form-group">
+            <label>👤 Full Name</label>
+            <input type="text" name="full_name" required>
+        </div>
+        <div class="form-group">
+            <label>🎓 Student ID</label>
+            <input type="text" name="student_id" required placeholder="e.g., UGR/1234/12">
+        </div>
+        <div class="form-group">
+            <label>📧 Email</label>
+            <input type="email" name="email" required placeholder="@student.aau.edu.et">
+        </div>
+        <div class="form-group">
+            <label>🔑 Password</label>
+            <input type="password" name="password" required>
+        </div>
+        <div class="form-group">
+            <label>✓ Confirm Password</label>
+            <input type="password" name="confirm_password" required>
+        </div>
+        <button type="submit" class="btn">Register</button>
+    </form>
+    
+    <p style="text-align: center; margin-top: 1.5rem;">
+        Already registered? <a href="/login" style="color: #002B5C;">Login here</a>
+    </p>
+</div>
+{% endblock %}
+"""
+
+# Dashboard Template
+DASHBOARD_TEMPLATE = """
+{% extends "base.html" %}
+{% block content %}
+<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+    <h2 style="color: #002B5C;">👋 Welcome, {{ session.user_name }}</h2>
+    <div>
+        <span class="status-badge">Model Trained: {{ 'Yes' if model_trained else 'No' }}</span>
+        <a href="/logout" class="btn" style="width: auto; padding: 0.5rem 1rem; margin-left: 1rem;">🚪 Logout</a>
+    </div>
+</div>
+
+<div class="grid-2">
+    <!-- Training Section -->
+    <div class="card">
+        <h3 style="margin-bottom: 1.5rem;">📚 Train Model</h3>
+        <p style="color: #666; margin-bottom: 1rem;">Upload labeled images <strong>(minimum 3 images per class, 2+ classes)</strong></p>
+        
+        <div id="imageRows"></div>
+        <button class="btn" onclick="addRow()" style="margin-bottom: 1rem;">+ Add Image</button>
+        <button class="btn" onclick="trainModel()" id="trainBtn">🚀 Start Training</button>
+        <div id="trainingResult" style="margin-top: 1rem;"></div>
+    </div>
+    
+    <!-- Classification Section -->
+    <div class="card">
+        <h3 style="margin-bottom: 1.5rem;">🎯 Classify Image</h3>
+        
+        <div class="upload-area" onclick="document.getElementById('fileInput').click()" style="border: 3px dashed #002B5C; padding: 2rem; text-align: center; border-radius: 10px; cursor: pointer; margin-bottom: 1rem;">
+            <input type="file" id="fileInput" accept="image/*" style="display:none;">
+            <p style="font-size: 3rem; margin-bottom: 0.5rem;">📸</p>
+            <p>Click to select image</p>
+        </div>
+        
+        <img id="preview" src="#" style="max-width: 100%; max-height: 200px; display: none; margin: 1rem 0; border-radius: 10px;">
+        <button class="btn" onclick="predictImage()" id="predictBtn">🔍 Classify</button>
+        <div id="predictionResult" style="margin-top: 1rem;"></div>
+    </div>
+</div>
+
+<script>
+    let rowCount = 0;
+    
+    function addRow() {
+        const container = document.getElementById('imageRows');
+        const row = document.createElement('div');
+        row.className = 'image-row';
+        row.id = `row_${rowCount}`;
+        row.innerHTML = `
+            <input type="file" accept="image/*" style="flex:2;" onchange="previewImage(this, ${rowCount})" required>
+            <input type="text" id="label_${rowCount}" placeholder="Label (e.g., cat)" style="flex:1;" required>
+            <button onclick="removeRow(${rowCount})" style="background:#dc3545; color:white; border:none; padding:5px 10px; border-radius:5px;">✕</button>
+            <img id="preview_${rowCount}" class="thumbnail" style="display:none;">
+        `;
+        container.appendChild(row);
+        rowCount++;
+    }
+    
+    function removeRow(id) {
+        const row = document.getElementById(`row_${id}`);
+        if (row) row.remove();
+    }
+    
+    function previewImage(input, rowId) {
+        const file = input.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const preview = document.getElementById(`preview_${rowId}`);
+                preview.src = e.target.result;
+                preview.style.display = 'inline';
+            }
+            reader.readAsDataURL(file);
+        }
+    }
+    
+    function validateTrainingData() {
+        const rows = document.querySelectorAll('[id^="row_"]');
+        const labels = new Set();
+        let totalImages = 0;
+        
+        for (let row of rows) {
+            const fileInput = row.querySelector('input[type="file"]');
+            const labelInput = row.querySelector('input[type="text"]');
+            
+            if (fileInput.files[0] && labelInput.value) {
+                totalImages++;
+                labels.add(labelInput.value.trim());
+            }
+        }
+        
+        return {
+            isValid: totalImages >= 4 && labels.size >= 2,
+            totalImages: totalImages,
+            numClasses: labels.size
+        };
+    }
+    
+    async function trainModel() {
+        const validation = validateTrainingData();
+        
+        if (validation.totalImages < 4) {
+            showError('trainingResult', 'Need at least 4 total images (3+ per class recommended)');
+            return;
+        }
+        
+        if (validation.numClasses < 2) {
+            showError('trainingResult', 'Need at least 2 different classes');
+            return;
+        }
+        
+        const formData = new FormData();
+        const rows = document.querySelectorAll('[id^="row_"]');
+        
+        for (let row of rows) {
+            const fileInput = row.querySelector('input[type="file"]');
+            const labelInput = row.querySelector('input[type="text"]');
+            
+            if (fileInput.files[0] && labelInput.value) {
+                formData.append('images', fileInput.files[0]);
+                formData.append('labels', labelInput.value.trim());
+            }
+        }
+        
+        document.getElementById('trainBtn').disabled = true;
+        showLoading('trainingResult');
+        
+        try {
+            const response = await fetch('/train', { method: 'POST', body: formData });
+            const data = await response.json();
+            
+            if (data.success) {
+                showSuccess('trainingResult', 
+                    `Training Complete!<br>Accuracy: ${(data.metrics.accuracy * 100).toFixed(2)}%<br>Classes: ${data.metrics.classes.join(', ')}<br>Samples: ${data.metrics.samples}`
+                );
+            } else {
+                showError('trainingResult', data.error);
+            }
+        } catch (error) {
+            showError('trainingResult', error.message);
+        } finally {
+            document.getElementById('trainBtn').disabled = false;
+        }
+    }
+    
+    document.getElementById('fileInput').addEventListener('change', function(e) {
+        const file = e.target.files[0];
+        if (file) {
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                const preview = document.getElementById('preview');
+                preview.src = e.target.result;
+                preview.style.display = 'block';
+            }
+            reader.readAsDataURL(file);
+        }
+    });
+    
+    async function predictImage() {
+        const fileInput = document.getElementById('fileInput');
+        if (!fileInput.files[0]) {
+            alert('Please select an image first');
+            return;
+        }
+        
+        const formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        
+        document.getElementById('predictBtn').disabled = true;
+        showLoading('predictionResult');
+        
+        try {
+            const response = await fetch('/predict', { method: 'POST', body: formData });
+            const data = await response.json();
+            
+            if (data.success) {
+                let html = '<h4 style="margin-bottom:1rem;">Results:</h4>';
+                data.predictions.forEach(p => {
+                    html += `<div class="result-item"><span>${p.class}</span><span>${p.probability}</span></div>`;
+                });
+                document.getElementById('predictionResult').innerHTML = html;
+            } else {
+                showError('predictionResult', data.error);
+            }
+        } catch (error) {
+            showError('predictionResult', error.message);
+        } finally {
+            document.getElementById('predictBtn').disabled = false;
+        }
+    }
+    
+    // Initialize with 3 rows to encourage enough data
+    addRow(); addRow(); addRow();
+</script>
+{% endblock %}
+"""
 
 @app.route('/')
 def index():
-    return render_template_string(HTML)
+    return render_template_string(INDEX_TEMPLATE)
 
-@app.route('/health')
-def health():
-    return jsonify({
-        'status': 'ok',
-        'model_loaded': model.deep_model is not None,
-        'model_trained': model.is_trained,
-        'classes': list(model.classes) if model.classes else []
-    })
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        student_id = request.form.get('student_id')
+        password = request.form.get('password')
+        
+        user = User.query.filter_by(student_id=student_id).first()
+        
+        if user and user.check_password(password):
+            session['user_id'] = user.id
+            session['user_name'] = user.full_name
+            session.permanent = True
+            flash(f'Welcome back, {user.full_name}!', 'success')
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Invalid Student ID or Password', 'danger')
+    
+    return render_template_string(LOGIN_TEMPLATE)
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        student_id = request.form.get('student_id')
+        email = request.form.get('email')
+        full_name = request.form.get('full_name')
+        password = request.form.get('password')
+        confirm = request.form.get('confirm_password')
+        
+        if password != confirm:
+            flash('Passwords do not match', 'danger')
+            return redirect(url_for('register'))
+        
+        existing = User.query.filter_by(student_id=student_id).first()
+        if existing:
+            flash('Student ID already registered', 'danger')
+            return redirect(url_for('register'))
+        
+        user = User(student_id=student_id, email=email, full_name=full_name)
+        user.set_password(password)
+        
+        db.session.add(user)
+        db.session.commit()
+        
+        flash('Registration successful! Please login.', 'success')
+        return redirect(url_for('login'))
+    
+    return render_template_string(REGISTER_TEMPLATE)
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    return render_template_string(
+        DASHBOARD_TEMPLATE,
+        model_trained=model.is_trained,
+        session=session
+    )
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    flash('You have been logged out', 'success')
+    return redirect(url_for('index'))
 
 @app.route('/train', methods=['POST'])
+@login_required
 def train():
-    logger.info("=" * 50)
-    logger.info("TRAIN REQUEST RECEIVED")
-    logger.info("=" * 50)
-    
     try:
         files = request.files.getlist('images')
         labels = request.form.getlist('labels')
         
-        logger.info(f"Number of files received: {len(files)}")
-        logger.info(f"Number of labels received: {len(labels)}")
-        logger.info(f"Labels: {labels}")
+        if len(files) < 4:
+            return jsonify({'error': 'Need at least 4 images (3+ per class recommended)'}), 400
         
-        if len(files) < 2:
-            return jsonify({'error': 'Need at least 2 images'}), 400
-        
-        if len(files) != len(labels):
-            return jsonify({'error': f'Number of files ({len(files)}) does not match number of labels ({len(labels)})'}), 400
-        
-        # Read image data into memory
         image_data_list = []
         valid_labels = []
         
         for i, file in enumerate(files):
-            if file and file.filename:
-                file.seek(0)
+            if file and file.filename and i < len(labels):
                 img_bytes = file.read()
-                
-                if len(img_bytes) > 0 and i < len(labels):
-                    label = labels[i].strip()
-                    if label:
-                        image_data_list.append(img_bytes)
-                        valid_labels.append(label)
-                        logger.info(f"✓ Added: {file.filename} with label '{label}'")
+                label = labels[i].strip()
+                if len(img_bytes) > 0 and label:
+                    image_data_list.append(img_bytes)
+                    valid_labels.append(label)
         
-        if len(image_data_list) < 2:
-            return jsonify({'error': f'Need at least 2 valid images. Got {len(image_data_list)}'}), 400
-        
-        unique_classes = set(valid_labels)
-        if len(unique_classes) < 2:
-            return jsonify({'error': f'Need at least 2 different classes. Got: {unique_classes}'}), 400
-        
-        logger.info("Starting model training...")
-        metrics = model.train_supervised(image_data_list, valid_labels)
-        model.save()
+        metrics = model.train(image_data_list, valid_labels)
         
         return jsonify({'success': True, 'metrics': metrics})
         
     except Exception as e:
-        logger.error(f"Training error: {str(e)}")
+        logger.error(f"Training error: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/predict', methods=['POST'])
+@login_required
 def predict():
-    logger.info("=" * 50)
-    logger.info("PREDICT REQUEST RECEIVED")
-    logger.info("=" * 50)
-    
     try:
         if 'file' not in request.files:
             return jsonify({'error': 'No file provided'}), 400
         
         file = request.files['file']
-        
-        if file.filename == '':
-            return jsonify({'error': 'Empty filename'}), 400
-        
-        file.seek(0)
         img_bytes = file.read()
         
         if len(img_bytes) == 0:
             return jsonify({'error': 'Empty file'}), 400
         
         predictions = model.predict(img_bytes)
-        
         return jsonify({'success': True, 'predictions': predictions})
         
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
+        logger.error(f"Prediction error: {e}")
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host='0.0.0.0', port=port, debug=True)
