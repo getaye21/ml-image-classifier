@@ -8,14 +8,18 @@ from PIL import Image
 import os
 import uuid
 import joblib
-import base64
 import io
+import base64
 from werkzeug.utils import secure_filename
-import time
-import tempfile
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key'
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB max file size
 
 # Use /tmp for all file operations (Hugging Face compatible)
 UPLOAD_FOLDER = '/tmp/uploads'
@@ -26,19 +30,24 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 class SupervisedDeepBoostingClassifier:
     def __init__(self, model_name="google/vit-base-patch16-224"):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        logger.info(f"Using device: {self.device}")
         
         # Use cache_dir to avoid re-downloading
-        print(f"Loading model {model_name}...")
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(
-            model_name, 
-            cache_dir=CACHE_DIR
-        )
-        self.deep_model = AutoModel.from_pretrained(
-            model_name, 
-            cache_dir=CACHE_DIR
-        ).to(self.device)
-        self.deep_model.eval()
-        print("Model loaded successfully!")
+        logger.info(f"Loading model {model_name}...")
+        try:
+            self.feature_extractor = AutoFeatureExtractor.from_pretrained(
+                model_name, 
+                cache_dir=CACHE_DIR
+            )
+            self.deep_model = AutoModel.from_pretrained(
+                model_name, 
+                cache_dir=CACHE_DIR
+            ).to(self.device)
+            self.deep_model.eval()
+            logger.info("Model loaded successfully!")
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            raise
         
         self.boosting = xgb.XGBClassifier(
             n_estimators=200,
@@ -61,10 +70,20 @@ class SupervisedDeepBoostingClassifier:
         try:
             if isinstance(image_data, str):
                 # It's a file path
+                if not os.path.exists(image_data):
+                    logger.error(f"File not found: {image_data}")
+                    return None
                 image = Image.open(image_data).convert('RGB')
-            else:
-                # It's bytes or PIL Image
+            elif isinstance(image_data, bytes):
+                # It's bytes
                 image = Image.open(io.BytesIO(image_data)).convert('RGB')
+            else:
+                # Assume it's a PIL Image
+                image = image_data.convert('RGB')
+            
+            # Resize image if needed (ViT expects 224x224)
+            if image.size != (224, 224):
+                image = image.resize((224, 224))
             
             inputs = self.feature_extractor(images=image, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -75,39 +94,53 @@ class SupervisedDeepBoostingClassifier:
             
             return features.cpu().numpy().flatten()
         except Exception as e:
-            print(f"Feature extraction error: {e}")
+            logger.error(f"Feature extraction error: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def train_supervised(self, image_data_list, labels):
-        print(f"Training started with {len(image_data_list)} images...")
+        logger.info(f"Training started with {len(image_data_list)} images...")
+        
+        if len(image_data_list) < 2:
+            raise ValueError(f"Need at least 2 images for training. Got {len(image_data_list)}")
+        
         features = []
         valid_labels = []
         
-        for img_data, label in zip(image_data_list, labels):
+        for i, (img_data, label) in enumerate(zip(image_data_list, labels)):
+            logger.info(f"Processing image {i+1}/{len(image_data_list)} with label: {label}")
             feat = self.extract_deep_features(img_data)
             if feat is not None:
                 features.append(feat)
                 valid_labels.append(label)
-                print(f"✓ Processed: {label}")
+                logger.info(f"✓ Successfully processed: {label}")
             else:
-                print(f"✗ Failed to process image")
+                logger.error(f"✗ Failed to process image {i+1}")
         
         if len(features) < 2:
             raise ValueError(f"Need at least 2 valid images for training. Got {len(features)}")
         
         unique_classes = set(valid_labels)
+        logger.info(f"Unique classes detected: {unique_classes}")
+        
         if len(unique_classes) < 2:
             raise ValueError(f"Need at least 2 different classes. Got: {unique_classes}")
         
         X = np.array(features)
+        logger.info(f"Feature matrix shape: {X.shape}")
+        
         y = self.label_encoder.fit_transform(valid_labels)
         self.classes = self.label_encoder.classes_
+        logger.info(f"Encoded labels: {y}")
+        logger.info(f"Classes: {self.classes}")
         
-        print(f"Training XGBoost with {X.shape[0]} samples, {X.shape[1]} features...")
+        logger.info("Training XGBoost classifier...")
         self.boosting.fit(X, y)
         
         train_pred = self.boosting.predict(X)
         accuracy = np.mean(train_pred == y)
+        logger.info(f"Training accuracy: {accuracy:.4f}")
         
         self.is_trained = True
         
@@ -119,6 +152,7 @@ class SupervisedDeepBoostingClassifier:
     
     def predict(self, image_data, top_k=3):
         if not self.is_trained:
+            logger.warning("Model not trained yet")
             return [{'class': 'Model not trained', 'confidence': 0, 'probability': '0%'}]
         
         features = self.extract_deep_features(image_data)
@@ -147,7 +181,7 @@ class SupervisedDeepBoostingClassifier:
             'classes': self.classes,
             'is_trained': self.is_trained
         }, path)
-        print(f"Model saved to {path}")
+        logger.info(f"Model saved to {path}")
     
     def load(self, path='/tmp/model.pkl'):
         if os.path.exists(path):
@@ -156,15 +190,15 @@ class SupervisedDeepBoostingClassifier:
             self.label_encoder = data['encoder']
             self.classes = data['classes']
             self.is_trained = data['is_trained']
-            print(f"Model loaded from {path}")
+            logger.info(f"Model loaded from {path}")
             return True
         return False
 
 # Initialize model
-print("Initializing model...")
+logger.info("Initializing model...")
 model = SupervisedDeepBoostingClassifier()
 model.load()
-print("Ready!")
+logger.info("Ready!")
 
 HTML = """<!DOCTYPE html>
 <html>
@@ -179,14 +213,17 @@ HTML = """<!DOCTYPE html>
         .upload-area:hover { border-color: #667eea; }
         .btn { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; width: 100%; margin: 10px 0; font-size: 16px; }
         .btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
         .result-item { display: flex; justify-content: space-between; padding: 10px; background: #f0f0f0; margin: 5px 0; border-radius: 5px; }
-        .image-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; }
+        .image-row { display: flex; gap: 10px; margin-bottom: 10px; align-items: center; background: #f9f9f9; padding: 10px; border-radius: 5px; }
         #preview { max-width: 100%; max-height: 200px; display: none; margin: 10px 0; border-radius: 5px; }
         .status { background: #e3f2fd; padding: 15px; border-radius: 5px; margin: 10px 0; }
         .loading { text-align: center; padding: 20px; }
-        .loading::after { content: "⏳"; animation: spin 1s linear infinite; display: inline-block; }
+        .loading-spinner { display: inline-block; width: 20px; height: 20px; border: 3px solid #f3f3f3; border-top: 3px solid #667eea; border-radius: 50%; animation: spin 1s linear infinite; margin-right: 10px; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .thumbnail { max-width: 50px; max-height: 50px; border-radius: 5px; }
+        .thumbnail { max-width: 50px; max-height: 50px; border-radius: 5px; margin-left: 10px; }
+        .error { background: #ffebee; color: #c62828; padding: 10px; border-radius: 5px; margin: 10px 0; }
+        .success { background: #e8f5e9; color: #2e7d32; padding: 10px; border-radius: 5px; margin: 10px 0; }
     </style>
 </head>
 <body>
@@ -198,10 +235,10 @@ HTML = """<!DOCTYPE html>
     <div class="container">
         <div class="card">
             <h2>📚 Train Model</h2>
-            <p>Upload labeled images (need at least 2 different classes)</p>
+            <p>Upload labeled images <strong>(need at least 2 images with DIFFERENT labels)</strong></p>
             <div id="imageRows"></div>
-            <button class="btn" onclick="addRow()">+ Add Image</button>
-            <button class="btn" onclick="trainModel()">🚀 Start Training</button>
+            <button class="btn" onclick="addRow()" id="addBtn">+ Add Image</button>
+            <button class="btn" onclick="trainModel()" id="trainBtn">🚀 Start Training</button>
             <div id="trainingResult" class="status" style="display:none;"></div>
         </div>
         
@@ -213,7 +250,7 @@ HTML = """<!DOCTYPE html>
                 <p>📸 Click to select image</p>
             </div>
             <img id="preview" src="#">
-            <button class="btn" onclick="predictImage()">🔍 Classify</button>
+            <button class="btn" onclick="predictImage()" id="predictBtn">🔍 Classify</button>
             <div id="predictionResult"></div>
         </div>
     </div>
@@ -227,8 +264,8 @@ HTML = """<!DOCTYPE html>
             row.className = 'image-row';
             row.id = `row_${rowCount}`;
             row.innerHTML = `
-                <input type="file" accept="image/*" style="flex:2;" onchange="previewImage(this, ${rowCount})">
-                <input type="text" id="label_${rowCount}" placeholder="Label (e.g., cat)" style="flex:1;">
+                <input type="file" accept="image/*" style="flex:2;" onchange="previewImage(this, ${rowCount})" required>
+                <input type="text" id="label_${rowCount}" placeholder="Label (e.g., cat)" style="flex:1;" required>
                 <button onclick="removeRow(${rowCount})" style="background:#f44336; color:white; border:none; padding:5px 10px; border-radius:5px;">✕</button>
                 <img id="preview_${rowCount}" class="thumbnail" style="display:none;">
             `;
@@ -254,10 +291,43 @@ HTML = """<!DOCTYPE html>
             }
         }
         
+        function validateTrainingData() {
+            const rows = document.querySelectorAll('[id^="row_"]');
+            const labels = new Set();
+            let hasImages = false;
+            
+            for (let row of rows) {
+                const fileInput = row.querySelector('input[type="file"]');
+                const labelInput = row.querySelector('input[type="text"]');
+                
+                if (fileInput.files[0] && labelInput.value) {
+                    hasImages = true;
+                    labels.add(labelInput.value.trim());
+                }
+            }
+            
+            return {
+                isValid: hasImages && labels.size >= 2,
+                numClasses: labels.size,
+                hasImages: hasImages
+            };
+        }
+        
         async function trainModel() {
+            const validation = validateTrainingData();
+            
+            if (!validation.hasImages) {
+                alert('Please add at least one image with a label');
+                return;
+            }
+            
+            if (validation.numClasses < 2) {
+                alert(`Need at least 2 DIFFERENT classes. You have ${validation.numClasses} class(es). Please add images with different labels (e.g., 'cat' and 'dog')`);
+                return;
+            }
+            
             const formData = new FormData();
             const rows = document.querySelectorAll('[id^="row_"]');
-            let hasData = false;
             
             for (let row of rows) {
                 const fileInput = row.querySelector('input[type="file"]');
@@ -265,18 +335,16 @@ HTML = """<!DOCTYPE html>
                 
                 if (fileInput.files[0] && labelInput.value) {
                     formData.append('images', fileInput.files[0]);
-                    formData.append('labels', labelInput.value);
-                    hasData = true;
+                    formData.append('labels', labelInput.value.trim());
                 }
             }
             
-            if (!hasData) {
-                alert('Please add at least one image with a label');
-                return;
-            }
+            // Disable buttons during training
+            document.getElementById('trainBtn').disabled = true;
+            document.getElementById('addBtn').disabled = true;
             
             document.getElementById('trainingResult').style.display = 'block';
-            document.getElementById('trainingResult').innerHTML = '<div class="loading">Training in progress... ⏳</div>';
+            document.getElementById('trainingResult').innerHTML = '<div class="loading"><span class="loading-spinner"></span>Training in progress... ⏳</div>';
             
             try {
                 const response = await fetch('/train', { 
@@ -284,17 +352,16 @@ HTML = """<!DOCTYPE html>
                     body: formData
                 });
                 
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.error || 'Training failed');
-                }
-                
                 const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.error || `Server error: ${response.status}`);
+                }
                 
                 if (data.success) {
                     document.getElementById('trainingResult').innerHTML = `
-                        <div style="background:#4CAF50; color:white; padding:10px; border-radius:5px;">
-                            ✅ Training Complete!<br>
+                        <div class="success">
+                            ✅ <strong>Training Complete!</strong><br>
                             Accuracy: ${(data.metrics.accuracy * 100).toFixed(2)}%<br>
                             Classes: ${data.metrics.classes.join(', ')}<br>
                             Samples: ${data.metrics.samples}
@@ -303,10 +370,14 @@ HTML = """<!DOCTYPE html>
                 }
             } catch (error) {
                 document.getElementById('trainingResult').innerHTML = `
-                    <div style="background:#f44336; color:white; padding:10px; border-radius:5px;">
-                        ❌ Error: ${error.message}
+                    <div class="error">
+                        ❌ <strong>Error:</strong> ${error.message}
                     </div>
                 `;
+            } finally {
+                // Re-enable buttons
+                document.getElementById('trainBtn').disabled = false;
+                document.getElementById('addBtn').disabled = false;
             }
         }
         
@@ -333,7 +404,10 @@ HTML = """<!DOCTYPE html>
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
             
-            document.getElementById('predictionResult').innerHTML = '<div class="loading">Classifying... ⏳</div>';
+            // Disable predict button
+            document.getElementById('predictBtn').disabled = true;
+            
+            document.getElementById('predictionResult').innerHTML = '<div class="loading"><span class="loading-spinner"></span>Classifying... ⏳</div>';
             
             try {
                 const response = await fetch('/predict', { 
@@ -341,12 +415,11 @@ HTML = """<!DOCTYPE html>
                     body: formData 
                 });
                 
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.error || 'Prediction failed');
-                }
-                
                 const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.error || `Server error: ${response.status}`);
+                }
                 
                 if (data.success) {
                     let html = '<h3>Results:</h3>';
@@ -357,15 +430,19 @@ HTML = """<!DOCTYPE html>
                 }
             } catch (error) {
                 document.getElementById('predictionResult').innerHTML = `
-                    <div style="background:#f44336; color:white; padding:10px; border-radius:5px;">
-                        ❌ Error: ${error.message}
+                    <div class="error">
+                        ❌ <strong>Error:</strong> ${error.message}
                     </div>
                 `;
+            } finally {
+                // Re-enable predict button
+                document.getElementById('predictBtn').disabled = false;
             }
         }
         
-        // Initialize with one row
-        addRow();
+        // Initialize with two rows to encourage proper training
+        addRow(); // First row
+        addRow(); // Second row
     </script>
 </body>
 </html>"""
@@ -374,57 +451,134 @@ HTML = """<!DOCTYPE html>
 def index():
     return render_template_string(HTML)
 
+@app.route('/health')
+def health():
+    return jsonify({
+        'status': 'ok',
+        'model_loaded': model.deep_model is not None,
+        'model_trained': model.is_trained,
+        'classes': list(model.classes) if model.classes else []
+    })
+
 @app.route('/train', methods=['POST'])
 def train():
-    files = request.files.getlist('images')
-    labels = request.form.getlist('labels')
-    
-    if len(files) < 2:
-        return jsonify({'error': 'Need at least 2 images'}), 400
-    
-    # Read image data into memory instead of saving to disk first
-    image_data_list = []
-    valid_labels = []
-    
-    for file in files:
-        if file:
-            # Read file bytes immediately
-            img_bytes = file.read()
-            image_data_list.append(img_bytes)
-    
-    # Match labels with files
-    for label in labels:
-        if label:
-            valid_labels.append(label.strip())
-    
-    if len(valid_labels) != len(image_data_list):
-        return jsonify({'error': 'Labels count mismatch'}), 400
+    logger.info("=" * 50)
+    logger.info("TRAIN REQUEST RECEIVED")
+    logger.info("=" * 50)
     
     try:
+        # Debug: print all request parts
+        logger.debug(f"Files in request: {list(request.files.keys())}")
+        logger.debug(f"Form data: {list(request.form.keys())}")
+        
+        files = request.files.getlist('images')
+        labels = request.form.getlist('labels')
+        
+        logger.info(f"Number of files received: {len(files)}")
+        logger.info(f"Number of labels received: {len(labels)}")
+        logger.info(f"Labels: {labels}")
+        
+        # Print details of each file
+        for i, file in enumerate(files):
+            logger.info(f"File {i}: {file.filename}, content_type: {file.content_type}")
+        
+        if len(files) < 2:
+            logger.error("Less than 2 files received")
+            return jsonify({'error': 'Need at least 2 images'}), 400
+        
+        # Check if we have matching files and labels
+        if len(files) != len(labels):
+            logger.error(f"Mismatch - {len(files)} files vs {len(labels)} labels")
+            return jsonify({'error': f'Number of files ({len(files)}) does not match number of labels ({len(labels)})'}), 400
+        
+        # Read image data into memory
+        image_data_list = []
+        valid_labels = []
+        
+        for i, file in enumerate(files):
+            if file and file.filename:
+                # Read file bytes
+                file.seek(0)  # Ensure we're at the start of the file
+                img_bytes = file.read()
+                logger.info(f"File {i} ({file.filename}) size: {len(img_bytes)} bytes")
+                
+                if len(img_bytes) == 0:
+                    logger.warning(f"File {i} ({file.filename}) is empty")
+                    continue
+                
+                # Get corresponding label
+                if i < len(labels):
+                    label = labels[i].strip()
+                    if label:
+                        image_data_list.append(img_bytes)
+                        valid_labels.append(label)
+                        logger.info(f"✓ Added: {file.filename} with label '{label}'")
+                    else:
+                        logger.warning(f"Empty label for file {file.filename}")
+                else:
+                    logger.warning(f"No label for file {file.filename}")
+        
+        logger.info(f"Final - Valid images: {len(image_data_list)}, Valid labels: {len(valid_labels)}")
+        logger.info(f"Unique labels: {set(valid_labels)}")
+        
+        if len(image_data_list) < 2:
+            logger.error(f"Less than 2 valid images after processing: {len(image_data_list)}")
+            return jsonify({'error': f'Need at least 2 valid images. Got {len(image_data_list)}'}), 400
+        
+        unique_classes = set(valid_labels)
+        if len(unique_classes) < 2:
+            logger.error(f"Need at least 2 different classes. Got: {unique_classes}")
+            return jsonify({'error': f'Need at least 2 different classes. Got: {unique_classes}. Please use different labels like "cat" and "dog"'}), 400
+        
+        logger.info("Starting model training...")
         metrics = model.train_supervised(image_data_list, valid_labels)
         model.save()
+        logger.info(f"Training successful: {metrics}")
         return jsonify({'success': True, 'metrics': metrics})
+        
     except Exception as e:
-        print(f"Training error: {str(e)}")
+        logger.error(f"Training error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file provided'}), 400
-    
-    file = request.files['file']
-    
-    if file.filename == '':
-        return jsonify({'error': 'Empty filename'}), 400
+    logger.info("=" * 50)
+    logger.info("PREDICT REQUEST RECEIVED")
+    logger.info("=" * 50)
     
     try:
+        if 'file' not in request.files:
+            logger.error("No file in request")
+            return jsonify({'error': 'No file provided'}), 400
+        
+        file = request.files['file']
+        
+        if file.filename == '':
+            logger.error("Empty filename")
+            return jsonify({'error': 'Empty filename'}), 400
+        
+        logger.info(f"File: {file.filename}, content_type: {file.content_type}")
+        
         # Read file bytes directly
+        file.seek(0)
         img_bytes = file.read()
+        logger.info(f"File size: {len(img_bytes)} bytes")
+        
+        if len(img_bytes) == 0:
+            logger.error("Empty file")
+            return jsonify({'error': 'Empty file'}), 400
+        
         predictions = model.predict(img_bytes)
+        logger.info(f"Predictions: {predictions}")
+        
         return jsonify({'success': True, 'predictions': predictions})
+        
     except Exception as e:
-        print(f"Prediction error: {str(e)}")
+        logger.error(f"Prediction error: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
