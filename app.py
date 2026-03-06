@@ -170,21 +170,32 @@ class SupervisedDeepBoostingClassifier:
             return [{'class': 'Error extracting features', 'confidence': 0, 'probability': '0%'}]
         
         features = features.reshape(1, -1)
+        logger.info(f"Feature shape for prediction: {features.shape}")
         
         # Use the booster directly for prediction
         dtest = xgb.DMatrix(features)
         probabilities = self.booster.predict(dtest)[0]
         
+        logger.info(f"Raw probabilities: {probabilities}")
+        logger.info(f"Classes: {self.classes}")
+        
+        # Ensure probabilities sum to 1 (they should, but just in case)
+        if np.sum(probabilities) > 0:
+            probabilities = probabilities / np.sum(probabilities)
+        
+        # Get top k predictions
         top_indices = np.argsort(probabilities)[-top_k:][::-1]
         
         predictions = []
         for idx in top_indices:
+            confidence = float(probabilities[idx])
             predictions.append({
                 'class': self.classes[idx],
-                'confidence': float(probabilities[idx]),
-                'probability': f"{probabilities[idx]:.2%}"
+                'confidence': confidence,
+                'probability': f"{confidence:.2%}"
             })
         
+        logger.info(f"Final predictions: {predictions}")
         return predictions
     
     def save(self, path='/tmp/model.pkl'):
