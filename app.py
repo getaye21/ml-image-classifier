@@ -56,7 +56,8 @@ def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if 'user_id' not in session:
-            return jsonify({'error': 'Authentication required'}), 401
+            flash('Please login first', 'warning')
+            return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
 
@@ -183,7 +184,9 @@ class SupervisedDeepBoostingClassifier:
 # Initialize model
 model = SupervisedDeepBoostingClassifier()
 
-# HTML Templates
+# ==================== ALL HTML TEMPLATES AS STRINGS ====================
+
+# Base template (now included as a string for inheritance)
 BASE_TEMPLATE = """
 <!DOCTYPE html>
 <html>
@@ -248,10 +251,6 @@ BASE_TEMPLATE = """
             text-align: center;
             margin-bottom: 2rem;
         }
-        .auth-header img {
-            width: 80px;
-            margin-bottom: 1rem;
-        }
         .form-group {
             margin-bottom: 1.5rem;
         }
@@ -284,6 +283,9 @@ BASE_TEMPLATE = """
             cursor: pointer;
             transition: transform 0.3s, box-shadow 0.3s;
             width: 100%;
+            display: inline-block;
+            text-decoration: none;
+            text-align: center;
         }
         .btn:hover {
             transform: translateY(-2px);
@@ -291,6 +293,11 @@ BASE_TEMPLATE = """
         }
         .btn-secondary {
             background: #6c757d;
+        }
+        .btn-small {
+            width: auto;
+            padding: 0.5rem 1rem;
+            font-size: 0.9rem;
         }
         .alert {
             padding: 1rem;
@@ -363,6 +370,12 @@ BASE_TEMPLATE = """
             border-radius: 50px;
             font-size: 0.8rem;
             display: inline-block;
+        }
+        .flex-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1rem;
         }
         @media (max-width: 768px) {
             .grid-2 { grid-template-columns: 1fr; }
@@ -529,11 +542,11 @@ REGISTER_TEMPLATE = """
 DASHBOARD_TEMPLATE = """
 {% extends "base.html" %}
 {% block content %}
-<div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem;">
+<div class="flex-row">
     <h2 style="color: #002B5C;">👋 Welcome, {{ session.user_name }}</h2>
     <div>
         <span class="status-badge">Model Trained: {{ 'Yes' if model_trained else 'No' }}</span>
-        <a href="/logout" class="btn" style="width: auto; padding: 0.5rem 1rem; margin-left: 1rem;">🚪 Logout</a>
+        <a href="/logout" class="btn btn-small" style="margin-left: 1rem;">🚪 Logout</a>
     </div>
 </div>
 
@@ -716,11 +729,13 @@ DASHBOARD_TEMPLATE = """
         }
     }
     
-    // Initialize with 3 rows to encourage enough data
+    // Initialize with 3 rows
     addRow(); addRow(); addRow();
 </script>
 {% endblock %}
 """
+
+# ==================== ROUTES ====================
 
 @app.route('/')
 def index():
@@ -809,6 +824,9 @@ def train():
                 if len(img_bytes) > 0 and label:
                     image_data_list.append(img_bytes)
                     valid_labels.append(label)
+        
+        if len(image_data_list) < 4:
+            return jsonify({'error': f'Only {len(image_data_list)} valid images. Need at least 4'}), 400
         
         metrics = model.train(image_data_list, valid_labels)
         
