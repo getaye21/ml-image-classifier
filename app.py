@@ -49,18 +49,7 @@ class SupervisedDeepBoostingClassifier:
             logger.error(f"Failed to load model: {e}")
             raise
         
-        self.boosting = xgb.XGBClassifier(
-            n_estimators=200,
-            max_depth=8,
-            learning_rate=0.1,
-            subsample=0.8,
-            colsample_bytree=0.8,
-            objective='multi:softprob',
-            eval_metric='mlogloss',
-            use_label_encoder=False,
-            random_state=42
-        )
-        
+        self.boosting = None
         self.label_encoder = LabelEncoder()
         self.classes = []
         self.is_trained = False
@@ -132,13 +121,40 @@ class SupervisedDeepBoostingClassifier:
         
         y = self.label_encoder.fit_transform(valid_labels)
         self.classes = self.label_encoder.classes_
+        num_classes = len(self.classes)
         logger.info(f"Encoded labels: {y}")
-        logger.info(f"Classes: {self.classes}")
+        logger.info(f"Classes: {self.classes}, num_classes: {num_classes}")
         
-        logger.info("Training XGBoost classifier...")
-        self.boosting.fit(X, y)
+        # FIX: Use XGBoost native API to avoid sklearn wrapper issues
+        logger.info(f"Training XGBoost classifier with native API...")
         
-        train_pred = self.boosting.predict(X)
+        # Convert to DMatrix for native API
+        dtrain = xgb.DMatrix(X, label=y)
+        
+        # Set parameters explicitly
+        params = {
+            'objective': 'multi:softprob',
+            'num_class': num_classes,
+            'max_depth': 8,
+            'eta': 0.1,
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'eval_metric': 'mlogloss',
+            'seed': 42
+        }
+        
+        # Train the model
+        bst = xgb.train(params, dtrain, num_boost_round=200)
+        
+        # Create a sklearn-compatible wrapper for predictions
+        from xgboost import XGBClassifier
+        self.boosting = XGBClassifier()
+        self.boosting._Booster = bst
+        self.boosting.classes_ = self.classes
+        
+        # Make predictions for accuracy calculation
+        train_pred_proba = bst.predict(dtrain)
+        train_pred = np.argmax(train_pred_proba, axis=1)
         accuracy = np.mean(train_pred == y)
         logger.info(f"Training accuracy: {accuracy:.4f}")
         
@@ -151,7 +167,7 @@ class SupervisedDeepBoostingClassifier:
         }
     
     def predict(self, image_data, top_k=3):
-        if not self.is_trained:
+        if not self.is_trained or self.boosting is None:
             logger.warning("Model not trained yet")
             return [{'class': 'Model not trained', 'confidence': 0, 'probability': '0%'}]
         
@@ -160,7 +176,10 @@ class SupervisedDeepBoostingClassifier:
             return [{'class': 'Error extracting features', 'confidence': 0, 'probability': '0%'}]
         
         features = features.reshape(1, -1)
-        probabilities = self.boosting.predict_proba(features)[0]
+        
+        # Use the booster directly for prediction
+        dtest = xgb.DMatrix(features)
+        probabilities = self.boosting._Booster.predict(dtest)[0]
         
         top_indices = np.argsort(probabilities)[-top_k:][::-1]
         
@@ -175,21 +194,25 @@ class SupervisedDeepBoostingClassifier:
         return predictions
     
     def save(self, path='/tmp/model.pkl'):
-        joblib.dump({
-            'boosting': self.boosting,
-            'encoder': self.label_encoder,
-            'classes': self.classes,
-            'is_trained': self.is_trained
-        }, path)
-        logger.info(f"Model saved to {path}")
+        if self.boosting is not None:
+            joblib.dump({
+                'booster': self.boosting._Booster,
+                'encoder': self.label_encoder,
+                'classes': self.classes,
+                'is_trained': self.is_trained
+            }, path)
+            logger.info(f"Model saved to {path}")
     
     def load(self, path='/tmp/model.pkl'):
         if os.path.exists(path):
             data = joblib.load(path)
-            self.boosting = data['boosting']
+            from xgboost import XGBClassifier
+            self.boosting = XGBClassifier()
+            self.boosting._Booster = data['booster']
             self.label_encoder = data['encoder']
             self.classes = data['classes']
             self.is_trained = data['is_trained']
+            self.boosting.classes_ = self.classes
             logger.info(f"Model loaded from {path}")
             return True
         return False
