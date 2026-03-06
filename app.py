@@ -49,7 +49,7 @@ class SupervisedDeepBoostingClassifier:
             logger.error(f"Failed to load model: {e}")
             raise
         
-        self.boosting = None
+        self.booster = None  # Store the XGBoost booster directly
         self.label_encoder = LabelEncoder()
         self.classes = []
         self.is_trained = False
@@ -125,7 +125,7 @@ class SupervisedDeepBoostingClassifier:
         logger.info(f"Encoded labels: {y}")
         logger.info(f"Classes: {self.classes}, num_classes: {num_classes}")
         
-        # FIX: Use XGBoost native API to avoid sklearn wrapper issues
+        # Use XGBoost native API
         logger.info(f"Training XGBoost classifier with native API...")
         
         # Convert to DMatrix for native API
@@ -143,17 +143,11 @@ class SupervisedDeepBoostingClassifier:
             'seed': 42
         }
         
-        # Train the model
-        bst = xgb.train(params, dtrain, num_boost_round=200)
-        
-        # Create a sklearn-compatible wrapper for predictions
-        from xgboost import XGBClassifier
-        self.boosting = XGBClassifier()
-        self.boosting._Booster = bst
-        self.boosting.classes_ = self.classes
+        # Train the model and store booster directly
+        self.booster = xgb.train(params, dtrain, num_boost_round=200)
         
         # Make predictions for accuracy calculation
-        train_pred_proba = bst.predict(dtrain)
+        train_pred_proba = self.booster.predict(dtrain)
         train_pred = np.argmax(train_pred_proba, axis=1)
         accuracy = np.mean(train_pred == y)
         logger.info(f"Training accuracy: {accuracy:.4f}")
@@ -167,7 +161,7 @@ class SupervisedDeepBoostingClassifier:
         }
     
     def predict(self, image_data, top_k=3):
-        if not self.is_trained or self.boosting is None:
+        if not self.is_trained or self.booster is None:
             logger.warning("Model not trained yet")
             return [{'class': 'Model not trained', 'confidence': 0, 'probability': '0%'}]
         
@@ -179,7 +173,7 @@ class SupervisedDeepBoostingClassifier:
         
         # Use the booster directly for prediction
         dtest = xgb.DMatrix(features)
-        probabilities = self.boosting._Booster.predict(dtest)[0]
+        probabilities = self.booster.predict(dtest)[0]
         
         top_indices = np.argsort(probabilities)[-top_k:][::-1]
         
@@ -194,9 +188,9 @@ class SupervisedDeepBoostingClassifier:
         return predictions
     
     def save(self, path='/tmp/model.pkl'):
-        if self.boosting is not None:
+        if self.booster is not None:
             joblib.dump({
-                'booster': self.boosting._Booster,
+                'booster': self.booster,
                 'encoder': self.label_encoder,
                 'classes': self.classes,
                 'is_trained': self.is_trained
@@ -206,13 +200,10 @@ class SupervisedDeepBoostingClassifier:
     def load(self, path='/tmp/model.pkl'):
         if os.path.exists(path):
             data = joblib.load(path)
-            from xgboost import XGBClassifier
-            self.boosting = XGBClassifier()
-            self.boosting._Booster = data['booster']
+            self.booster = data['booster']
             self.label_encoder = data['encoder']
             self.classes = data['classes']
             self.is_trained = data['is_trained']
-            self.boosting.classes_ = self.classes
             logger.info(f"Model loaded from {path}")
             return True
         return False
@@ -463,9 +454,9 @@ HTML = """<!DOCTYPE html>
             }
         }
         
-        // Initialize with two rows to encourage proper training
-        addRow(); // First row
-        addRow(); // Second row
+        // Initialize with two rows
+        addRow();
+        addRow();
     </script>
 </body>
 </html>"""
@@ -490,10 +481,6 @@ def train():
     logger.info("=" * 50)
     
     try:
-        # Debug: print all request parts
-        logger.debug(f"Files in request: {list(request.files.keys())}")
-        logger.debug(f"Form data: {list(request.form.keys())}")
-        
         files = request.files.getlist('images')
         labels = request.form.getlist('labels')
         
@@ -501,17 +488,10 @@ def train():
         logger.info(f"Number of labels received: {len(labels)}")
         logger.info(f"Labels: {labels}")
         
-        # Print details of each file
-        for i, file in enumerate(files):
-            logger.info(f"File {i}: {file.filename}, content_type: {file.content_type}")
-        
         if len(files) < 2:
-            logger.error("Less than 2 files received")
             return jsonify({'error': 'Need at least 2 images'}), 400
         
-        # Check if we have matching files and labels
         if len(files) != len(labels):
-            logger.error(f"Mismatch - {len(files)} files vs {len(labels)} labels")
             return jsonify({'error': f'Number of files ({len(files)}) does not match number of labels ({len(labels)})'}), 400
         
         # Read image data into memory
@@ -520,49 +500,31 @@ def train():
         
         for i, file in enumerate(files):
             if file and file.filename:
-                # Read file bytes
-                file.seek(0)  # Ensure we're at the start of the file
+                file.seek(0)
                 img_bytes = file.read()
-                logger.info(f"File {i} ({file.filename}) size: {len(img_bytes)} bytes")
                 
-                if len(img_bytes) == 0:
-                    logger.warning(f"File {i} ({file.filename}) is empty")
-                    continue
-                
-                # Get corresponding label
-                if i < len(labels):
+                if len(img_bytes) > 0 and i < len(labels):
                     label = labels[i].strip()
                     if label:
                         image_data_list.append(img_bytes)
                         valid_labels.append(label)
                         logger.info(f"✓ Added: {file.filename} with label '{label}'")
-                    else:
-                        logger.warning(f"Empty label for file {file.filename}")
-                else:
-                    logger.warning(f"No label for file {file.filename}")
-        
-        logger.info(f"Final - Valid images: {len(image_data_list)}, Valid labels: {len(valid_labels)}")
-        logger.info(f"Unique labels: {set(valid_labels)}")
         
         if len(image_data_list) < 2:
-            logger.error(f"Less than 2 valid images after processing: {len(image_data_list)}")
             return jsonify({'error': f'Need at least 2 valid images. Got {len(image_data_list)}'}), 400
         
         unique_classes = set(valid_labels)
         if len(unique_classes) < 2:
-            logger.error(f"Need at least 2 different classes. Got: {unique_classes}")
-            return jsonify({'error': f'Need at least 2 different classes. Got: {unique_classes}. Please use different labels like "cat" and "dog"'}), 400
+            return jsonify({'error': f'Need at least 2 different classes. Got: {unique_classes}'}), 400
         
         logger.info("Starting model training...")
         metrics = model.train_supervised(image_data_list, valid_labels)
         model.save()
-        logger.info(f"Training successful: {metrics}")
+        
         return jsonify({'success': True, 'metrics': metrics})
         
     except Exception as e:
         logger.error(f"Training error: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 @app.route('/predict', methods=['POST'])
@@ -573,35 +535,25 @@ def predict():
     
     try:
         if 'file' not in request.files:
-            logger.error("No file in request")
             return jsonify({'error': 'No file provided'}), 400
         
         file = request.files['file']
         
         if file.filename == '':
-            logger.error("Empty filename")
             return jsonify({'error': 'Empty filename'}), 400
         
-        logger.info(f"File: {file.filename}, content_type: {file.content_type}")
-        
-        # Read file bytes directly
         file.seek(0)
         img_bytes = file.read()
-        logger.info(f"File size: {len(img_bytes)} bytes")
         
         if len(img_bytes) == 0:
-            logger.error("Empty file")
             return jsonify({'error': 'Empty file'}), 400
         
         predictions = model.predict(img_bytes)
-        logger.info(f"Predictions: {predictions}")
         
         return jsonify({'success': True, 'predictions': predictions})
         
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
-        import traceback
-        traceback.print_exc()
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
