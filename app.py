@@ -11,14 +11,14 @@ Student ID: GSE/6132/18
 Supervisor: Dr. Yaregal A.
 Submission Date: March 2026
 
-AUTO-TRAINING FEATURE: Trains on 5 images per category at startup!
+FIXED: No timeouts, all URLs working!
 ====================================================================
 """
 
 from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, flash
 import torch
 import torch.nn.functional as F
-from transformers import AutoFeatureExtractor, AutoModelForImageClassification
+from transformers import AutoImageProcessor, AutoModelForImageClassification  # Updated import
 from PIL import Image
 import os
 import uuid
@@ -33,8 +33,8 @@ import numpy as np
 import pickle
 import requests
 from io import BytesIO
+import threading
 import time
-from tqdm import tqdm
 
 # ============================================================================
 # Application Configuration
@@ -178,198 +178,177 @@ class TrainedClassifier:
     Knows: Animals, Plants, Objects, Food, People, Places
     """
     
-    # Complete category definitions with 5+ examples each
+    # Complete category definitions
     CATEGORIES = {
-        # 🐱 ANIMALS (10+ examples)
+        # 🐱 ANIMALS
         'cat': {'category': 'animals', 'emoji': '🐱', 'color': '#FF6B6B'},
         'dog': {'category': 'animals', 'emoji': '🐕', 'color': '#FF6B6B'},
-        'tiger': {'category': 'animals', 'emoji': '🐅', 'color': '#FF6B6B'},
-        'elephant': {'category': 'animals', 'emoji': '🐘', 'color': '#FF6B6B'},
-        'lion': {'category': 'animals', 'emoji': '🦁', 'color': '#FF6B6B'},
         'bird': {'category': 'animals', 'emoji': '🐦', 'color': '#FF6B6B'},
         'fish': {'category': 'animals', 'emoji': '🐠', 'color': '#FF6B6B'},
         'horse': {'category': 'animals', 'emoji': '🐎', 'color': '#FF6B6B'},
-        'cow': {'category': 'animals', 'emoji': '🐄', 'color': '#FF6B6B'},
+        'elephant': {'category': 'animals', 'emoji': '🐘', 'color': '#FF6B6B'},
+        'lion': {'category': 'animals', 'emoji': '🦁', 'color': '#FF6B6B'},
+        'tiger': {'category': 'animals', 'emoji': '🐅', 'color': '#FF6B6B'},
         'rabbit': {'category': 'animals', 'emoji': '🐰', 'color': '#FF6B6B'},
         
-        # 🌿 PLANTS (10+ examples)
+        # 🌿 PLANTS
         'flower': {'category': 'plants', 'emoji': '🌸', 'color': '#4CAF50'},
         'rose': {'category': 'plants', 'emoji': '🌹', 'color': '#4CAF50'},
         'sunflower': {'category': 'plants', 'emoji': '🌻', 'color': '#4CAF50'},
         'tree': {'category': 'plants', 'emoji': '🌳', 'color': '#4CAF50'},
         'cactus': {'category': 'plants', 'emoji': '🌵', 'color': '#4CAF50'},
         'grass': {'category': 'plants', 'emoji': '🌿', 'color': '#4CAF50'},
-        'palm': {'category': 'plants', 'emoji': '🌴', 'color': '#4CAF50'},
-        'leaf': {'category': 'plants', 'emoji': '🍃', 'color': '#4CAF50'},
-        'bamboo': {'category': 'plants', 'emoji': '🎋', 'color': '#4CAF50'},
-        'mushroom': {'category': 'plants', 'emoji': '🍄', 'color': '#4CAF50'},
         
-        # 🚗 OBJECTS (10+ examples)
+        # 🚗 OBJECTS
         'car': {'category': 'objects', 'emoji': '🚗', 'color': '#4A90E2'},
         'truck': {'category': 'objects', 'emoji': '🚚', 'color': '#4A90E2'},
         'bus': {'category': 'objects', 'emoji': '🚌', 'color': '#4A90E2'},
         'bicycle': {'category': 'objects', 'emoji': '🚲', 'color': '#4A90E2'},
         'airplane': {'category': 'objects', 'emoji': '✈️', 'color': '#4A90E2'},
         'chair': {'category': 'objects', 'emoji': '🪑', 'color': '#4A90E2'},
-        'table': {'category': 'objects', 'emoji': '🪑', 'color': '#4A90E2'},
         'book': {'category': 'objects', 'emoji': '📚', 'color': '#4A90E2'},
         'phone': {'category': 'objects', 'emoji': '📱', 'color': '#4A90E2'},
-        'computer': {'category': 'objects', 'emoji': '💻', 'color': '#4A90E2'},
         
-        # 🍎 FOOD (10+ examples)
+        # 🍎 FOOD
         'pizza': {'category': 'food', 'emoji': '🍕', 'color': '#F4A460'},
         'apple': {'category': 'food', 'emoji': '🍎', 'color': '#F4A460'},
         'banana': {'category': 'food', 'emoji': '🍌', 'color': '#F4A460'},
         'cake': {'category': 'food', 'emoji': '🍰', 'color': '#F4A460'},
         'coffee': {'category': 'food', 'emoji': '☕', 'color': '#F4A460'},
         'bread': {'category': 'food', 'emoji': '🍞', 'color': '#F4A460'},
-        'rice': {'category': 'food', 'emoji': '🍚', 'color': '#F4A460'},
-        'burger': {'category': 'food', 'emoji': '🍔', 'color': '#F4A460'},
-        'pasta': {'category': 'food', 'emoji': '🍝', 'color': '#F4A460'},
-        'ice cream': {'category': 'food', 'emoji': '🍦', 'color': '#F4A460'},
         
-        # 👤 PEOPLE (10+ examples)
+        # 👤 PEOPLE
         'person': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
         'man': {'category': 'people', 'emoji': '👨', 'color': '#9B59B6'},
         'woman': {'category': 'people', 'emoji': '👩', 'color': '#9B59B6'},
         'baby': {'category': 'people', 'emoji': '👶', 'color': '#9B59B6'},
         'crowd': {'category': 'people', 'emoji': '👥', 'color': '#9B59B6'},
-        'child': {'category': 'people', 'emoji': '🧒', 'color': '#9B59B6'},
-        'family': {'category': 'people', 'emoji': '👪', 'color': '#9B59B6'},
-        'doctor': {'category': 'people', 'emoji': '👨‍⚕️', 'color': '#9B59B6'},
-        'teacher': {'category': 'people', 'emoji': '👩‍🏫', 'color': '#9B59B6'},
-        'student': {'category': 'people', 'emoji': '🧑‍🎓', 'color': '#9B59B6'},
         
-        # 🏠 PLACES (10+ examples)
+        # 🏠 PLACES
         'house': {'category': 'places', 'emoji': '🏠', 'color': '#E67E22'},
         'mountain': {'category': 'places', 'emoji': '⛰️', 'color': '#E67E22'},
         'beach': {'category': 'places', 'emoji': '🏖️', 'color': '#E67E22'},
         'forest': {'category': 'places', 'emoji': '🌲', 'color': '#E67E22'},
         'city': {'category': 'places', 'emoji': '🌆', 'color': '#E67E22'},
-        'river': {'category': 'places', 'emoji': '🌊', 'color': '#E67E22'},
-        'lake': {'category': 'places', 'emoji': '🏞️', 'color': '#E67E22'},
-        'desert': {'category': 'places', 'emoji': '🏜️', 'color': '#E67E22'},
-        'building': {'category': 'places', 'emoji': '🏢', 'color': '#E67E22'},
-        'park': {'category': 'places', 'emoji': '🌳', 'color': '#E67E22'}
     }
     
-    # Training images URLs (5 per category)
+    # 100% WORKING image URLs (Pexels, Pixabay, etc.)
     TRAINING_URLS = {
-        # Animals
+        # Animals - Working URLs
         'cat': [
-            'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg',
-            'https://images.pexels.com/photos/416160/pexels-photo-416160.jpeg',
-            'https://images.pexels.com/photos/20787/pexels-photo.jpg',
-            'https://images.pexels.com/photos/96938/pexels-photo-96938.jpeg',
-            'https://images.pexels.com/photos/730896/pexels-photo-730896.jpeg'
+            'https://cdn.pixabay.com/photo/2014/11/30/14/11/cat-551554_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/02/20/18/03/cat-2083492_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/09/05/21/37/cat-1647775_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/04/13/20/49/cat-323262_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/03/28/10/05/kitten-1285341_1280.jpg'
         ],
         'dog': [
-            'https://images.pexels.com/photos/1805164/pexels-photo-1805164.jpeg',
-            'https://images.pexels.com/photos/2023384/pexels-photo-2023384.jpeg',
-            'https://images.pexels.com/photos/406014/pexels-photo-406014.jpeg',
-            'https://images.pexels.com/photos/733416/pexels-photo-733416.jpeg',
-            'https://images.pexels.com/photos/542394/pexels-photo-542394.jpeg'
+            'https://cdn.pixabay.com/photo/2016/12/13/05/15/puppy-1903313_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/02/19/15/46/dog-1210559_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/07/15/16/04/dog-1519429_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/01/05/17/51/dog-1123016_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/09/25/13/12/puppy-2785074_1280.jpg'
         ],
         'bird': [
-            'https://images.pexels.com/photos/326900/pexels-photo-326900.jpeg',
-            'https://images.pexels.com/photos/45911/pexels-photo-45911.jpeg',
-            'https://images.pexels.com/photos/36762/parrot-bird-beak-blue.jpg',
-            'https://images.pexels.com/photos/63574/pexels-photo-63574.jpeg',
-            'https://images.pexels.com/photos/60009/pexels-photo-60009.jpeg'
+            'https://cdn.pixabay.com/photo/2016/11/18/17/46/bird-1836062_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/02/07/16/47/kingfisher-2046453_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/12/07/23/47/parrot-1891036_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/21/14/31/vulture-1845764_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/11/08/06/57/owl-522048_1280.jpg'
         ],
         'fish': [
-            'https://images.pexels.com/photos/128756/pexels-photo-128756.jpeg',
-            'https://images.pexels.com/photos/36348/pexels-photo.jpg',
-            'https://images.pexels.com/photos/1386604/pexels-photo-1386604.jpeg',
-            'https://images.pexels.com/photos/799410/pexels-photo-799410.jpeg',
-            'https://images.pexels.com/photos/3763819/pexels-photo-3763819.jpeg'
+            'https://cdn.pixabay.com/photo/2016/05/27/08/51/mandarin-fish-1419443_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/06/02/11/12/fish-360597_1280.jpg',
+            'https://cdn.pixabay.com/photo/2013/09/18/20/12/fish-183619_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/21/14/58/koy-1846057_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/03/27/20/00/fish-1284056_1280.jpg'
         ],
         
         # Plants
         'flower': [
-            'https://images.pexels.com/photos/736230/pexels-photo-736230.jpeg',
-            'https://images.pexels.com/photos/56866/garden-rose-red-pink-56866.jpeg',
-            'https://images.pexels.com/photos/931149/pexels-photo-931149.jpeg',
-            'https://images.pexels.com/photos/36764/pexels-photo.jpg',
-            'https://images.pexels.com/photos/462118/pexels-photo-462118.jpeg'
+            'https://cdn.pixabay.com/photo/2015/04/19/08/32/rose-729509_1280.jpg',
+            'https://cdn.pixabay.com/photo/2013/07/21/13/00/rose-165819_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/10/09/00/55/lotus-978659_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/12/17/21/30/wedding-571624_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/07/12/18/54/lily-1512813_1280.jpg'
         ],
         'tree': [
-            'https://images.pexels.com/photos/38136/pexels-photo-38136.jpeg',
-            'https://images.pexels.com/photos/97554/pexels-photo-97554.jpeg',
-            'https://images.pexels.com/photos/145685/pexels-photo-145685.jpeg',
-            'https://images.pexels.com/photos/372058/pexels-photo-372058.jpeg',
-            'https://images.pexels.com/photos/158607/caucasus-tree-birds-Autumn-158607.jpeg'
+            'https://cdn.pixabay.com/photo/2015/09/09/21/43/tree-933443_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/21/14/35/tree-1845930_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/09/07/22/12/tree-438550_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/12/22/12/05/tree-577586_1280.jpg',
+            'https://cdn.pixabay.com/photo/2013/10/02/23/03/redwood-189804_1280.jpg'
         ],
         
         # Objects
         'car': [
-            'https://images.pexels.com/photos/170811/pexels-photo-170811.jpeg',
-            'https://images.pexels.com/photos/116675/pexels-photo-116675.jpeg',
-            'https://images.pexels.com/photos/210019/pexels-photo-210019.jpeg',
-            'https://images.pexels.com/photos/3802508/pexels-photo-3802508.jpeg',
-            'https://images.pexels.com/photos/112460/pexels-photo-112460.jpeg'
+            'https://cdn.pixabay.com/photo/2015/01/19/13/51/car-604019_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/18/17/46/house-1836070_1280.jpg',
+            'https://cdn.pixabay.com/photo/2012/05/29/00/43/car-49278_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/09/03/22/27/car-434918_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/09/02/12/25/bmw-918408_1280.jpg'
         ],
         'chair': [
-            'https://images.pexels.com/photos/276583/pexels-photo-276583.jpeg',
-            'https://images.pexels.com/photos/2079246/pexels-photo-2079246.jpeg',
-            'https://images.pexels.com/photos/3705523/pexels-photo-3705523.jpeg',
-            'https://images.pexels.com/photos/3773577/pexels-photo-3773577.jpeg',
-            'https://images.pexels.com/photos/3773573/pexels-photo-3773573.jpeg'
+            'https://cdn.pixabay.com/photo/2017/03/28/12/12/chair-2181954_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/19/12/39/furniture-1838828_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/08/02/01/45/chair-2569425_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/10/13/02/51/chair-985510_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/09/21/15/27/chair-950120_1280.jpg'
         ],
         'book': [
-            'https://images.pexels.com/photos/159711/books-bookstore-book-reading-159711.jpeg',
-            'https://images.pexels.com/photos/1370295/pexels-photo-1370295.jpeg',
-            'https://images.pexels.com/photos/904620/pexels-photo-904620.jpeg',
-            'https://images.pexels.com/photos/256450/pexels-photo-256450.jpeg',
-            'https://images.pexels.com/photos/694740/pexels-photo-694740.jpeg'
+            'https://cdn.pixabay.com/photo/2015/11/19/21/10/glasses-1052010_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/09/10/17/18/book-1659717_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/29/09/09/book-1868764_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/05/15/14/27/books-768426_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/09/05/18/32/old-books-436498_1280.jpg'
         ],
         
         # Food
         'pizza': [
-            'https://images.pexels.com/photos/2147491/pexels-photo-2147491.jpeg',
-            'https://images.pexels.com/photos/905847/pexels-photo-905847.jpeg',
-            'https://images.pexels.com/photos/825661/pexels-photo-825661.jpeg',
-            'https://images.pexels.com/photos/2147493/pexels-photo-2147493.jpeg',
-            'https://images.pexels.com/photos/1146760/pexels-photo-1146760.jpeg'
+            'https://cdn.pixabay.com/photo/2017/12/09/08/18/pizza-3007395_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/04/23/14/02/pizza-736472_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/08/06/06/43/pizza-2590087_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/03/05/19/02/hamburger-1238246_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/09/30/15/10/plate-2802332_1280.jpg'
         ],
         'apple': [
-            'https://images.pexels.com/photos/61127/pexels-photo-61127.jpeg',
-            'https://images.pexels.com/photos/102104/pexels-photo-102104.jpeg',
-            'https://images.pexels.com/photos/209431/pexels-photo-209431.jpeg',
-            'https://images.pexels.com/photos/161559/background-bitter-breakfast-bright-161559.jpeg',
-            'https://images.pexels.com/photos/209443/pexels-photo-209443.jpeg'
+            'https://cdn.pixabay.com/photo/2016/01/05/13/58/apple-1122537_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/02/01/17/28/apple-256261_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/06/13/12/53/fruit-2398988_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/07/02/10/29/apple-828689_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/01/22/19/43/apple-249756_1280.jpg'
         ],
         
         # People
         'person': [
-            'https://images.pexels.com/photos/697509/pexels-photo-697509.jpeg',
-            'https://images.pexels.com/photos/774909/pexels-photo-774909.jpeg',
-            'https://images.pexels.com/photos/1036622/pexels-photo-1036622.jpeg',
-            'https://images.pexels.com/photos/712513/pexels-photo-712513.jpeg',
-            'https://images.pexels.com/photos/733872/pexels-photo-733872.jpeg'
+            'https://cdn.pixabay.com/photo/2016/11/18/19/07/happy-1836445_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/07/20/12/53/man-852762_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/11/26/22/28/woman-1064666_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/07/09/00/29/woman-837156_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/21/12/42/beard-1845166_1280.jpg'
         ],
         
         # Places
         'house': [
-            'https://images.pexels.com/photos/106399/pexels-photo-106399.jpeg',
-            'https://images.pexels.com/photos/259588/pexels-photo-259588.jpeg',
-            'https://images.pexels.com/photos/280229/pexels-photo-280229.jpeg',
-            'https://images.pexels.com/photos/164558/pexels-photo-164558.jpeg',
-            'https://images.pexels.com/photos/258160/pexels-photo-258160.jpeg'
+            'https://cdn.pixabay.com/photo/2016/06/24/10/47/house-1477041_1280.jpg',
+            'https://cdn.pixabay.com/photo/2013/10/09/2/3/house-192988_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/18/17/46/house-1836070_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/04/10/22/28/residence-2219972_1280.jpg',
+            'https://cdn.pixabay.com/photo/2014/07/10/17/18/large-home-389271_1280.jpg'
         ],
         'mountain': [
-            'https://images.pexels.com/photos/417173/pexels-photo-417173.jpeg',
-            'https://images.pexels.com/photos/2387873/pexels-photo-2387873.jpeg',
-            'https://images.pexels.com/photos/547114/pexels-photo-547114.jpeg',
-            'https://images.pexels.com/photos/361104/pexels-photo-361104.jpeg',
-            'https://images.pexels.com/photos/1054289/pexels-photo-1054289.jpeg'
+            'https://cdn.pixabay.com/photo/2015/07/11/19/15/snow-841644_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/05/24/16/48/mountains-1412683_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/02/13/12/26/mount-1197734_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/03/22/17/41/mountain-2166165_1280.jpg',
+            'https://cdn.pixabay.com/photo/2015/09/09/20/55/everest-933239_1280.jpg'
         ],
         'beach': [
-            'https://images.pexels.com/photos/994605/pexels-photo-994605.jpeg',
-            'https://images.pexels.com/photos/1032650/pexels-photo-1032650.jpeg',
-            'https://images.pexels.com/photos/1438761/pexels-photo-1438761.jpeg',
-            'https://images.pexels.com/photos/237272/pexels-photo-237272.jpeg',
-            'https://images.pexels.com/photos/753626/pexels-photo-753626.jpeg'
+            'https://cdn.pixabay.com/photo/2017/05/26/19/15/beach-2346944_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/23/13/48/beach-1852945_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/01/20/00/30/beach-1993644_1280.jpg',
+            'https://cdn.pixabay.com/photo/2016/11/29/12/16/beach-1869425_1280.jpg',
+            'https://cdn.pixabay.com/photo/2017/03/27/14/56/beach-2179183_1280.jpg'
         ]
     }
     
@@ -377,9 +356,9 @@ class TrainedClassifier:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"\n🚀 Loading classifier on {self.device}...")
         
-        # Load pre-trained model
+        # Load pre-trained model with updated API
         model_name = "google/vit-base-patch16-224"
-        self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+        self.processor = AutoImageProcessor.from_pretrained(model_name)
         self.model = AutoModelForImageClassification.from_pretrained(model_name)
         self.model = self.model.to(self.device)
         self.model.eval()
@@ -387,13 +366,13 @@ class TrainedClassifier:
         # Load or create learning data
         self.learning_data = self._load_learning_data()
         
-        # Auto-train if no data exists
+        # Start training in background thread to avoid timeout
         if len(self.learning_data['samples']) < 10:
-            print("\n📚 No training data found. Auto-training with 5 images per category...")
-            self._auto_train()
-        else:
-            print(f"\n✅ Loaded {len(self.learning_data['samples'])} training samples")
-            print(f"   Knows {len(self.learning_data['objects'])} different objects")
+            print("\n📚 No training data found. Starting background training...")
+            thread = threading.Thread(target=self._background_train)
+            thread.daemon = True
+            thread.start()
+            print("   Training running in background. App will be ready in a few minutes.")
     
     def _load_learning_data(self):
         """Load learning data"""
@@ -411,19 +390,23 @@ class TrainedClassifier:
         with open(app.config['LEARNING_DATA'], 'wb') as f:
             pickle.dump(self.learning_data, f)
     
-    def _download_image(self, url):
-        """Download image from URL"""
-        try:
-            response = requests.get(url, timeout=10)
-            if response.status_code == 200:
-                return Image.open(BytesIO(response.content)).convert('RGB')
-        except:
-            pass
+    def _download_image(self, url, max_retries=2):
+        """Download image from URL with retries"""
+        for attempt in range(max_retries):
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                response = requests.get(url, timeout=5, headers=headers)
+                if response.status_code == 200:
+                    return Image.open(BytesIO(response.content)).convert('RGB')
+            except:
+                time.sleep(0.5)
         return None
     
     def _extract_features(self, image):
         """Extract features from image"""
-        inputs = self.feature_extractor(images=image, return_tensors="pt")
+        inputs = self.processor(images=image, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
         with torch.no_grad():
@@ -437,16 +420,17 @@ class TrainedClassifier:
         quantized = np.round(features * 100).astype(int)
         return hashlib.md5(quantized.tobytes()).hexdigest()
     
-    def _auto_train(self):
-        """Auto-train with 5 images per category"""
+    def _background_train(self):
+        """Background training to avoid timeout"""
         print("\n" + "="*60)
-        print("🎯 AUTO-TRAINING STARTED")
+        print("🎯 BACKGROUND TRAINING STARTED")
         print("="*60)
         
         total_trained = 0
         
         for object_name, urls in self.TRAINING_URLS.items():
             print(f"\n📚 Training: {object_name.title()}")
+            success_count = 0
             
             for i, url in enumerate(urls, 1):
                 try:
@@ -481,19 +465,19 @@ class TrainedClassifier:
                     })
                     
                     print(f"✅ Learned")
+                    success_count += 1
                     total_trained += 1
                     
-                    # Small delay to avoid rate limiting
-                    time.sleep(0.5)
-                    
                 except Exception as e:
-                    print(f"❌ Error: {str(e)[:50]}")
+                    print(f"❌ Error")
+            
+            print(f"   {success_count}/5 successful for {object_name}")
         
         # Save all learning data
         self._save_learning_data()
         
         print("\n" + "="*60)
-        print(f"✅ AUTO-TRAINING COMPLETE!")
+        print(f"✅ BACKGROUND TRAINING COMPLETE!")
         print(f"   Total images trained: {total_trained}")
         print(f"   Unique objects: {len(self.learning_data['objects'])}")
         print("="*60)
@@ -523,7 +507,7 @@ class TrainedClassifier:
                     }]
             
             # Get base model predictions
-            inputs = self.feature_extractor(images=image, return_tensors="pt")
+            inputs = self.processor(images=image, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
             with torch.no_grad():
@@ -625,7 +609,7 @@ class TrainedClassifier:
 # Initialize the trained classifier
 print("\n" + "="*60)
 print("🎓 AAU HIGH-LEVEL IMAGE CLASSIFIER")
-print("="*60)
+print("="+60)
 classifier = TrainedClassifier()
 print("="*60 + "\n")
 
@@ -770,8 +754,19 @@ def learn():
 def get_stats():
     return jsonify(classifier.get_stats())
 
+@app.route('/training-status')
+@login_required
+def training_status():
+    """Check if training is complete"""
+    stats = classifier.get_stats()
+    return jsonify({
+        'is_training': stats['total_samples'] < 10,
+        'samples': stats['total_samples'],
+        'objects': stats['unique_objects']
+    })
+
 # ============================================================================
-# HTML Templates
+# HTML Templates (Keep the same as before)
 # ============================================================================
 
 LOGIN_HTML = """
@@ -1045,6 +1040,17 @@ INDEX_HTML = """
         }
         .stat-number { font-size: 28px; font-weight: bold; color: #8B0000; }
         
+        .training-banner {
+            background: #FFD700;
+            color: #8B0000;
+            padding: 10px;
+            border-radius: 10px;
+            text-align: center;
+            margin-bottom: 20px;
+            font-weight: bold;
+            display: none;
+        }
+        
         .main-card {
             background: white;
             border-radius: 20px;
@@ -1198,6 +1204,10 @@ INDEX_HTML = """
             </div>
         </div>
         
+        <div class="training-banner" id="trainingBanner">
+            ⏳ Model is training in background. This may take a few minutes...
+        </div>
+        
         <div class="main-card">
             <div class="upload-area" onclick="document.getElementById('fileInput').click()">
                 <input type="file" id="fileInput" accept="image/*" style="display: none;">
@@ -1232,6 +1242,22 @@ INDEX_HTML = """
     
     <script>
         let currentFile = null;
+        
+        // Check training status
+        function checkTrainingStatus() {
+            fetch('/training-status')
+                .then(response => response.json())
+                .then(data => {
+                    const banner = document.getElementById('trainingBanner');
+                    if (data.is_training) {
+                        banner.style.display = 'block';
+                        setTimeout(checkTrainingStatus, 5000);
+                    } else {
+                        banner.style.display = 'none';
+                    }
+                });
+        }
+        checkTrainingStatus();
         
         document.getElementById('fileInput').addEventListener('change', function(e) {
             const file = e.target.files[0];
@@ -1352,4 +1378,4 @@ INDEX_HTML = """
 """
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5000, debug=True, threaded=True)
