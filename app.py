@@ -609,7 +609,7 @@ class TrainedClassifier:
 # Initialize the trained classifier
 print("\n" + "="*60)
 print("🎓 AAU HIGH-LEVEL IMAGE CLASSIFIER")
-print("="+60)
+print("="*60)
 classifier = TrainedClassifier()
 print("="*60 + "\n")
 
