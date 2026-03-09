@@ -1,7 +1,6 @@
+# AAU MSc Project - Getaye Fiseha (GSE/6132/18)
 flask==2.3.3
-flask-sqlalchemy==3.0.5
 torch==2.0.1
-torchvision==0.15.2
 transformers==4.35.0
 xgboost==2.0.3
 scikit-learn==1.3.2
@@ -9,3 +8,4 @@ pillow==10.1.0
 numpy==1.24.3
 gunicorn==21.2.0
 joblib==1.3.2
+bcrypt==4.0.1         
