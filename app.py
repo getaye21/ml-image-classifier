@@ -4,7 +4,7 @@ ADDIS ABABA UNIVERSITY - College of Natural and Computational Sciences
 Department of Computer Science
 ====================================================================
 
-Project: High-Level Image Classifier with User Management
+Project: Image Classifier with User Management
 Student Name: Getaye Fiseha
 Student ID: GSE/6132/18
 Program: MSc in Computer Science
@@ -12,14 +12,6 @@ Stream: Network & Security
 Course: COSC 6041 - Machine Learning
 Supervisor: Dr. Yaregal A.
 Submission Date: March 2026
-
-CATEGORIES:
-🐱 Animals: cat, dog, tiger, elephant, bird, fish, lion, horse, cow, monkey
-🌿 Plants: flower, tree, rose, sunflower, cactus, grass, leaf, palm, fern
-🚗 Objects: car, bicycle, airplane, chair, book, phone, computer, bottle, clock
-🍎 Food: pizza, apple, banana, cake, coffee, bread, rice, sandwich, chocolate
-👤 People: person, man, woman, baby, crowd, portrait, child, family, group
-🏠 Places: house, mountain, beach, forest, city, river, ocean, desert, building
 ====================================================================
 """
 
@@ -34,11 +26,8 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 from functools import wraps
-import re
 import json
-import numpy as np
 from werkzeug.utils import secure_filename
-import joblib
 
 # ============================================================================
 # Application Configuration
@@ -53,11 +42,8 @@ app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(hours=2)
 app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 app.config['USER_DATA'] = 'users.json'
-app.config['MODEL_DATA'] = 'category_model.pkl'
 
-# Create directories
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
-os.makedirs('training_data', exist_ok=True)
 
 # ============================================================================
 # User Management System
@@ -66,11 +52,9 @@ os.makedirs('training_data', exist_ok=True)
 class UserManager:
     def __init__(self):
         self.users_file = app.config['USER_DATA']
-        self.login_attempts = {}
         self._init_default_users()
     
     def _init_default_users(self):
-        """Create default admin user"""
         if not os.path.exists(self.users_file):
             users = {
                 'getaye': {
@@ -78,9 +62,7 @@ class UserManager:
                     'full_name': 'Getaye Fiseha',
                     'role': 'admin',
                     'student_id': 'GSE/6132/18',
-                    'email': 'getaye.fiseha@aau.edu.et',
-                    'created_at': datetime.now().isoformat(),
-                    'can_create_users': True
+                    'created_at': datetime.now().isoformat()
                 }
             }
             self._save_users(users)
@@ -99,54 +81,36 @@ class UserManager:
                 return json.load(f)
         return {}
     
-    def create_user(self, username, password, full_name, email, role='user', created_by=None):
+    def create_user(self, username, password, full_name, role='user', created_by=None):
         users = self._load_users()
-        
         if username in users:
-            return False, "Username already exists"
-        
-        if any(u['email'] == email for u in users.values()):
-            return False, "Email already registered"
+            return False, "Username exists"
         
         users[username] = {
             'password_hash': self._hash_password(password),
             'full_name': full_name,
-            'email': email,
             'role': role,
             'created_at': datetime.now().isoformat(),
-            'created_by': created_by,
-            'last_login': None,
-            'can_create_users': (role == 'admin')
+            'created_by': created_by
         }
-        
         self._save_users(users)
-        return True, "User created successfully"
+        return True, "User created"
     
-    def verify_login(self, username, password, ip_address):
+    def verify_login(self, username, password):
         users = self._load_users()
-        
-        if username not in users:
-            return False, "Invalid username or password"
-        
-        if self._hash_password(password) == users[username]['password_hash']:
-            # Update last login
-            users[username]['last_login'] = datetime.now().isoformat()
-            self._save_users(users)
+        if username in users and self._hash_password(password) == users[username]['password_hash']:
             return True, users[username]
-        
-        return False, "Invalid username or password"
+        return False, "Invalid credentials"
     
     def get_all_users(self):
         users = self._load_users()
-        # Remove password hashes for security
         for u in users.values():
             u.pop('password_hash', None)
         return users
     
     def delete_user(self, username, admin_user):
-        if username == 'getaye':  # Can't delete main admin
-            return False, "Cannot delete primary admin"
-        
+        if username == 'getaye':
+            return False, "Cannot delete main admin"
         users = self._load_users()
         if username in users:
             del users[username]
@@ -157,14 +121,13 @@ class UserManager:
 user_manager = UserManager()
 
 # ============================================================================
-# Login Decorators
+# Login Decorator
 # ============================================================================
 
 def login_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
         if 'username' not in session:
-            flash('Please login first', 'warning')
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated
@@ -172,125 +135,20 @@ def login_required(f):
 def admin_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if 'username' not in session:
-            return redirect(url_for('login'))
-        if session.get('role') != 'admin':
+        if 'username' not in session or session.get('role') != 'admin':
             flash('Admin access required', 'error')
             return redirect(url_for('index'))
         return f(*args, **kwargs)
     return decorated
 
 # ============================================================================
-# Category Mapper - Maps 1000+ ImageNet classes to 6 main categories
+# Image Classifier - Shows Actual Object Names
 # ============================================================================
 
-class CategoryMapper:
-    """Maps specific objects to high-level categories"""
-    
-    # Category definitions with keywords
-    CATEGORIES = {
-        'animals': {
-            'name': '🐱 Animals',
-            'emoji': '🐱',
-            'color': '#FF6B6B',
-            'keywords': [
-                'cat', 'dog', 'tiger', 'lion', 'elephant', 'bird', 'fish', 'horse', 
-                'cow', 'monkey', 'bear', 'rabbit', 'sheep', 'goat', 'chicken', 'duck',
-                'eagle', 'hawk', 'snake', 'lizard', 'frog', 'whale', 'dolphin', 'shark',
-                'zebra', 'giraffe', 'deer', 'fox', 'wolf', 'mouse', 'rat', 'squirrel',
-                'kangaroo', 'panda', 'koala', 'penguin', 'swan', 'goose', 'turkey'
-            ]
-        },
-        'plants': {
-            'name': '🌿 Plants',
-            'emoji': '🌿',
-            'color': '#4CAF50',
-            'keywords': [
-                'flower', 'tree', 'rose', 'sunflower', 'cactus', 'grass', 'leaf', 
-                'palm', 'fern', 'bush', 'plant', 'weed', 'vine', 'moss', 'mushroom',
-                'daisy', 'tulip', 'lily', 'orchid', 'bamboo', 'oak', 'pine', 'maple',
-                'willow', 'ivy', 'clover', 'algae', 'fern', 'coral'
-            ]
-        },
-        'objects': {
-            'name': '🚗 Objects',
-            'emoji': '🚗',
-            'color': '#4A90E2',
-            'keywords': [
-                'car', 'truck', 'bus', 'bicycle', 'motorcycle', 'airplane', 'train',
-                'boat', 'ship', 'chair', 'table', 'desk', 'book', 'phone', 'computer',
-                'laptop', 'bottle', 'cup', 'glass', 'plate', 'bowl', 'fork', 'spoon',
-                'knife', 'clock', 'watch', 'umbrella', 'bag', 'backpack', 'wallet',
-                'key', 'door', 'window', 'bed', 'sofa', 'lamp', 'television', 'radio'
-            ]
-        },
-        'food': {
-            'name': '🍎 Food',
-            'emoji': '🍎',
-            'color': '#F4A460',
-            'keywords': [
-                'pizza', 'apple', 'banana', 'cake', 'coffee', 'bread', 'rice', 'sandwich',
-                'chocolate', 'pasta', 'burger', 'fries', 'salad', 'soup', 'steak', 'fish',
-                'chicken', 'egg', 'cheese', 'milk', 'juice', 'water', 'wine', 'beer',
-                'ice cream', 'cookie', 'donut', 'pie', 'candy', 'fruit', 'vegetable',
-                'tomato', 'potato', 'carrot', 'onion', 'garlic', 'lemon', 'orange'
-            ]
-        },
-        'people': {
-            'name': '👤 People',
-            'emoji': '👤',
-            'color': '#9B59B6',
-            'keywords': [
-                'person', 'man', 'woman', 'child', 'baby', 'crowd', 'people', 'human',
-                'boy', 'girl', 'teenager', 'adult', 'senior', 'family', 'group',
-                'portrait', 'face', 'head', 'hand', 'foot', 'body', 'couple', 'friends',
-                'worker', 'doctor', 'teacher', 'student', 'athlete', 'singer', 'dancer'
-            ]
-        },
-        'places': {
-            'name': '🏠 Places',
-            'emoji': '🏠',
-            'color': '#E67E22',
-            'keywords': [
-                'house', 'building', 'mountain', 'beach', 'forest', 'city', 'river',
-                'ocean', 'desert', 'lake', 'park', 'garden', 'farm', 'field', 'hill',
-                'valley', 'cave', 'island', 'waterfall', 'volcano', 'glacier', 'coast',
-                'sky', 'cloud', 'sunset', 'sunrise', 'night', 'day', 'street', 'road',
-                'bridge', 'tunnel', 'tower', 'castle', 'temple', 'church', 'school'
-            ]
-        }
-    }
-    
-    @classmethod
-    def get_category(cls, class_name):
-        """Map a specific class name to one of the 6 categories"""
-        class_lower = class_name.lower()
-        
-        for category_id, category_info in cls.CATEGORIES.items():
-            for keyword in category_info['keywords']:
-                if keyword in class_lower:
-                    return category_id, category_info
-        
-        # Default to objects if no match
-        return 'objects', cls.CATEGORIES['objects']
-    
-    @classmethod
-    def get_all_categories(cls):
-        return cls.CATEGORIES
-
-# ============================================================================
-# High-Level Category Classifier
-# ============================================================================
-
-class HighLevelClassifier:
-    """
-    Classifies images into 6 main categories:
-    Animals, Plants, Objects, Food, People, Places
-    """
-    
+class ImageClassifier:
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"🚀 Loading classifier on {self.device}...")
+        print(f"Loading model on {self.device}...")
         
         # Load pre-trained model
         model_name = "google/vit-base-patch16-224"
@@ -300,127 +158,46 @@ class HighLevelClassifier:
         self.model.eval()
         
         # Get ImageNet labels
-        self.imagenet_labels = self.model.config.id2label
-        
-        # Category mapper
-        self.categories = CategoryMapper.get_all_categories()
-        
-        # Training data storage
-        self.training_data = self._load_training_data()
-        
-        print(f"✅ Classifier ready! Categories:")
-        for cat in self.categories.values():
-            print(f"   {cat['emoji']} {cat['name']}")
+        self.labels = self.model.config.id2label
+        print(f"Model loaded! Knows {len(self.labels)} objects")
     
-    def _load_training_data(self):
-        """Load additional training data if exists"""
-        if os.path.exists('training_stats.json'):
-            with open('training_stats.json', 'r') as f:
-                return json.load(f)
-        return {cat: 0 for cat in self.categories.keys()}
-    
-    def _save_training_data(self):
-        with open('training_stats.json', 'w') as f:
-            json.dump(self.training_data, f, indent=2)
-    
-    def predict(self, image_path):
-        """
-        Predict which of the 6 categories the image belongs to
-        Returns probabilities for each category
-        """
+    def predict(self, image_path, top_k=5):
+        """Return top-k object predictions"""
         try:
             # Load and preprocess image
             image = Image.open(image_path).convert('RGB')
             inputs = self.feature_extractor(images=image, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
-            # Get model predictions
+            # Get predictions
             with torch.no_grad():
                 outputs = self.model(**inputs)
-                logits = outputs.logits
-                probabilities = F.softmax(logits, dim=-1)[0]
+                probabilities = F.softmax(outputs.logits, dim=-1)[0]
             
-            # Map to categories
-            category_scores = {cat_id: 0.0 for cat_id in self.categories.keys()}
-            category_details = {cat_id: [] for cat_id in self.categories.keys()}
+            # Get top predictions
+            top_probs, top_indices = torch.topk(probabilities, top_k)
             
-            # Aggregate probabilities by category
-            top_probs, top_indices = torch.topk(probabilities, 50)
-            
+            results = []
             for prob, idx in zip(top_probs, top_indices):
                 class_id = idx.item()
-                class_name = self.imagenet_labels[class_id].lower()
+                class_name = self.labels[class_id]
+                # Clean up class name
+                class_name = class_name.split(',')[0].strip().replace('_', ' ')
                 confidence = prob.item()
                 
-                # Find which category this belongs to
-                category_id, category_info = CategoryMapper.get_category(class_name)
-                
-                # Add to category score
-                category_scores[category_id] += confidence
-                category_details[category_id].append({
-                    'class': class_name,
-                    'confidence': confidence
-                })
-            
-            # Normalize scores to sum to 1
-            total = sum(category_scores.values())
-            if total > 0:
-                for cat_id in category_scores:
-                    category_scores[cat_id] /= total
-            
-            # Sort categories by score
-            sorted_categories = sorted(
-                category_scores.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )
-            
-            # Prepare results
-            results = []
-            for cat_id, score in sorted_categories:
-                cat_info = self.categories[cat_id]
                 results.append({
-                    'category_id': cat_id,
-                    'category': cat_info['name'],
-                    'emoji': cat_info['emoji'],
-                    'color': cat_info['color'],
-                    'confidence': score,
-                    'probability': f"{score:.1%}",
-                    'top_matches': category_details[cat_id][:3]  # Top 3 specific items
+                    'object': class_name.title(),
+                    'confidence': confidence,
+                    'percentage': f"{confidence:.1%}"
                 })
             
             return results
             
         except Exception as e:
-            print(f"Prediction error: {e}")
+            print(f"Error: {e}")
             return None
-    
-    def add_training_sample(self, image_path, category_id):
-        """Add a training sample to improve category recognition"""
-        try:
-            # Extract features
-            image = Image.open(image_path).convert('RGB')
-            inputs = self.feature_extractor(images=image, return_tensors="pt")
-            
-            # Save for future fine-tuning
-            train_dir = f'training_data/{category_id}'
-            os.makedirs(train_dir, exist_ok=True)
-            
-            filename = f"{uuid.uuid4()}.jpg"
-            filepath = os.path.join(train_dir, filename)
-            image.save(filepath)
-            
-            # Update stats
-            self.training_data[category_id] = self.training_data.get(category_id, 0) + 1
-            self._save_training_data()
-            
-            return True
-        except Exception as e:
-            print(f"Error saving training sample: {e}")
-            return False
 
-# Initialize the classifier
-classifier = HighLevelClassifier()
+classifier = ImageClassifier()
 
 # ============================================================================
 # Authentication Routes
@@ -432,30 +209,27 @@ def login():
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
-        ip_address = request.remote_addr
         
-        success, result = user_manager.verify_login(username, password, ip_address)
+        success, result = user_manager.verify_login(username, password)
         
         if success:
             session['username'] = username
             session['full_name'] = result['full_name']
             session['role'] = result['role']
             session.permanent = True
-            flash(f'Welcome, {result["full_name"]}!', 'success')
             return redirect(url_for('index'))
         else:
-            error = result
+            error = "Invalid username or password"
     
     return render_template_string(LOGIN_HTML, error=error)
 
 @app.route('/logout')
 def logout():
     session.clear()
-    flash('Logged out successfully', 'info')
     return redirect(url_for('login'))
 
 # ============================================================================
-# User Management Routes (Admin Only)
+# User Management Routes
 # ============================================================================
 
 @app.route('/users')
@@ -470,47 +244,31 @@ def create_user():
     username = request.form.get('username')
     password = request.form.get('password')
     full_name = request.form.get('full_name')
-    email = request.form.get('email')
     role = request.form.get('role', 'user')
     
-    success, message = user_manager.create_user(
-        username, password, full_name, email, role, session['username']
-    )
-    
-    if success:
-        flash(message, 'success')
-    else:
-        flash(message, 'error')
-    
+    success, message = user_manager.create_user(username, password, full_name, role, session['username'])
+    flash(message, 'success' if success else 'error')
     return redirect(url_for('user_list'))
 
 @app.route('/users/delete/<username>', methods=['POST'])
 @admin_required
 def delete_user(username):
     success, message = user_manager.delete_user(username, session['username'])
-    if success:
-        flash(message, 'success')
-    else:
-        flash(message, 'error')
+    flash(message, 'success' if success else 'error')
     return redirect(url_for('user_list'))
 
 # ============================================================================
-# Main Classification Routes
+# Main Routes
 # ============================================================================
 
 @app.route('/')
 @login_required
 def index():
-    """Main classification page"""
-    return render_template_string(INDEX_HTML, 
-                                 session=session,
-                                 categories=classifier.categories,
-                                 training_stats=classifier.training_data)
+    return render_template_string(INDEX_HTML, session=session)
 
 @app.route('/predict', methods=['POST'])
 @login_required
 def predict():
-    """Predict category of uploaded image"""
     if 'file' not in request.files:
         return jsonify({'error': 'No file'}), 400
     
@@ -524,66 +282,21 @@ def predict():
     file.save(filepath)
     
     try:
-        # Get predictions
         predictions = classifier.predict(filepath)
         
         if predictions:
             return jsonify({
                 'success': True,
-                'predictions': predictions,
-                'filename': file.filename
+                'predictions': predictions
             })
         else:
-            return jsonify({'error': 'Could not classify image'}), 500
+            return jsonify({'error': 'Could not classify'}), 500
             
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     finally:
         if os.path.exists(filepath):
             os.remove(filepath)
-
-@app.route('/train', methods=['POST'])
-@login_required
-def train():
-    """Add training sample to improve category"""
-    if 'file' not in request.files or 'category' not in request.form:
-        return jsonify({'error': 'Missing data'}), 400
-    
-    file = request.files['file']
-    category_id = request.form['category']
-    
-    if category_id not in classifier.categories:
-        return jsonify({'error': 'Invalid category'}), 400
-    
-    # Save temp file
-    filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
-    
-    try:
-        # Add training sample
-        success = classifier.add_training_sample(filepath, category_id)
-        
-        if success:
-            return jsonify({
-                'success': True,
-                'message': f'Added to {classifier.categories[category_id]["name"]} training set',
-                'stats': classifier.training_data
-            })
-        else:
-            return jsonify({'error': 'Could not save training sample'}), 500
-            
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-    finally:
-        if os.path.exists(filepath):
-            os.remove(filepath)
-
-@app.route('/stats')
-@login_required
-def get_stats():
-    """Get training statistics"""
-    return jsonify(classifier.training_data)
 
 # ============================================================================
 # HTML Templates
@@ -593,129 +306,86 @@ LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AAU - Login | Image Classifier</title>
+    <title>AAU - Login</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: linear-gradient(135deg, #006B3F 0%, #FCD116 100%); 
-            min-height: 100vh; 
-            display: flex; 
-            align-items: center; 
-            justify-content: center; 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #006B3F, #FCD116);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
         }
-        .login-container { 
-            background: white; 
-            padding: 40px; 
-            border-radius: 20px; 
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3); 
-            width: 100%; 
-            max-width: 400px; 
+        .login-box {
+            background: white;
+            padding: 40px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            width: 100%;
+            max-width: 380px;
         }
-        .aau-header { 
-            text-align: center; 
-            margin-bottom: 30px; 
+        h2 {
+            color: #006B3F;
+            text-align: center;
+            margin-bottom: 30px;
+            font-size: 28px;
         }
-        .aau-header h1 { 
-            color: #006B3F; 
-            font-size: 24px; 
-            margin-bottom: 5px; 
+        .input-group {
+            margin-bottom: 20px;
         }
-        .aau-header p { 
-            color: #FCD116; 
-            font-weight: bold; 
+        .input-group input {
+            width: 100%;
+            padding: 12px 15px;
+            border: 2px solid #e1e1e1;
+            border-radius: 8px;
+            font-size: 16px;
+            transition: border-color 0.3s;
         }
-        .form-group { 
-            margin-bottom: 20px; 
+        .input-group input:focus {
+            outline: none;
+            border-color: #FCD116;
         }
-        .form-group input { 
-            width: 100%; 
-            padding: 12px; 
-            border: 2px solid #e1e1e1; 
-            border-radius: 8px; 
-            font-size: 16px; 
-            transition: border-color 0.3s; 
+        button {
+            width: 100%;
+            padding: 14px;
+            background: linear-gradient(135deg, #006B3F, #FCD116);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
         }
-        .form-group input:focus { 
-            outline: none; 
-            border-color: #FCD116; 
+        button:hover {
+            transform: translateY(-2px);
         }
-        .btn { 
-            width: 100%; 
-            padding: 14px; 
-            background: linear-gradient(135deg, #006B3F, #FCD116); 
-            color: white; 
-            border: none; 
-            border-radius: 8px; 
-            font-size: 18px; 
-            font-weight: 600; 
-            cursor: pointer; 
-            transition: transform 0.3s; 
-        }
-        .btn:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 10px 20px rgba(0,107,63,0.3); 
-        }
-        .error { 
-            background: #fee; 
-            color: #c33; 
-            padding: 12px; 
-            border-radius: 8px; 
-            margin-bottom: 20px; 
-            text-align: center; 
-        }
-        .info { 
-            text-align: center; 
-            margin-top: 20px; 
-            padding: 15px; 
-            background: #f5f5f5; 
-            border-radius: 8px; 
-            font-size: 14px; 
-        }
-        .info p { 
-            margin: 5px 0; 
-            color: #666; 
-        }
-        .student-info {
-            background: #e8f5e9;
-            padding: 15px;
+        .error {
+            background: #fee;
+            color: #c33;
+            padding: 12px;
             border-radius: 8px;
             margin-bottom: 20px;
             text-align: center;
-            border-left: 4px solid #FCD116;
         }
     </style>
 </head>
 <body>
-    <div class="login-container">
-        <div class="aau-header">
-            <h1>🎓 ADDIS ABABA UNIVERSITY</h1>
-            <p>MSc Computer Science - Network & Security</p>
-        </div>
-        
-        <div class="student-info">
-            <strong>Getaye Fiseha</strong><br>
-            GSE/6132/18 | Dr. Yaregal A.
-        </div>
-        
+    <div class="login-box">
+        <h2>🎓 AAU Image Classifier</h2>
         {% if error %}
         <div class="error">{{ error }}</div>
         {% endif %}
-        
         <form method="POST">
-            <div class="form-group">
+            <div class="input-group">
                 <input type="text" name="username" placeholder="Username" required>
             </div>
-            <div class="form-group">
+            <div class="input-group">
                 <input type="password" name="password" placeholder="Password" required>
             </div>
-            <button type="submit" class="btn">🔐 Login to Classifier</button>
+            <button type="submit">Login</button>
         </form>
-        
-        <div class="info">
-            <p><strong>Admin:</strong> getaye / Getaye@2827</p>
-            <p><strong>Demo Users:</strong> Ask admin to create</p>
-        </div>
     </div>
 </body>
 </html>
@@ -725,96 +395,87 @@ USERS_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AAU - User Management | Admin</title>
+    <title>User Management</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; }
-        .navbar { 
-            background: linear-gradient(135deg, #006B3F, #FCD116); 
-            padding: 15px 30px; 
-            color: white; 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; }
+        .navbar {
+            background: #006B3F;
+            padding: 15px 30px;
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .nav-links a {
+            color: white;
+            text-decoration: none;
+            margin-left: 20px;
         }
         .container { max-width: 1200px; margin: 40px auto; padding: 0 20px; }
-        .card { 
-            background: white; 
-            border-radius: 15px; 
-            padding: 30px; 
-            box-shadow: 0 10px 30px rgba(0,0,0,0.1); 
-            margin-bottom: 30px; 
+        .card {
+            background: white;
+            border-radius: 15px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.1);
+            margin-bottom: 30px;
         }
-        .btn { 
-            background: linear-gradient(135deg, #006B3F, #FCD116); 
-            color: white; 
-            border: none; 
-            padding: 10px 20px; 
-            border-radius: 5px; 
-            cursor: pointer; 
-            text-decoration: none; 
-            display: inline-block; 
+        .btn {
+            background: #006B3F;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
         }
         .btn-danger { background: #dc3545; }
         table { width: 100%; border-collapse: collapse; }
-        th { background: #006B3F; color: #FCD116; padding: 12px; text-align: left; }
+        th { background: #006B3F; color: white; padding: 12px; text-align: left; }
         td { padding: 12px; border-bottom: 1px solid #ddd; }
         .form-group { margin-bottom: 15px; }
-        .form-group input, .form-group select { 
-            width: 100%; 
-            padding: 10px; 
-            border: 2px solid #ddd; 
-            border-radius: 5px; 
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #ddd;
+            border-radius: 5px;
         }
     </style>
 </head>
 <body>
     <div class="navbar">
-        <h2>👑 Admin Panel - User Management</h2>
-        <div>
-            <a href="/" style="color: white; margin-right: 20px;">Home</a>
-            <a href="/logout" style="color: white;">Logout</a>
+        <h2>👑 User Management</h2>
+        <div class="nav-links">
+            <a href="/">Home</a>
+            <a href="/logout">Logout</a>
         </div>
     </div>
     
     <div class="container">
         <div class="card">
-            <h2 style="color: #006B3F; margin-bottom: 20px;">➕ Create New User</h2>
+            <h3 style="margin-bottom: 20px;">Create New User</h3>
             <form action="/users/create" method="POST">
-                <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px;">
-                    <div class="form-group">
-                        <input type="text" name="username" placeholder="Username" required>
-                    </div>
-                    <div class="form-group">
-                        <input type="password" name="password" placeholder="Password" required>
-                    </div>
-                    <div class="form-group">
-                        <input type="text" name="full_name" placeholder="Full Name" required>
-                    </div>
-                    <div class="form-group">
-                        <input type="email" name="email" placeholder="Email" required>
-                    </div>
-                    <div class="form-group">
-                        <select name="role">
-                            <option value="user">User</option>
-                            <option value="admin">Admin</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <button type="submit" class="btn">Create User</button>
-                    </div>
+                <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px;">
+                    <input type="text" name="username" placeholder="Username" required>
+                    <input type="password" name="password" placeholder="Password" required>
+                    <input type="text" name="full_name" placeholder="Full Name" required>
+                    <select name="role">
+                        <option value="user">User</option>
+                        <option value="admin">Admin</option>
+                    </select>
+                    <button type="submit" class="btn">Create</button>
                 </div>
             </form>
         </div>
         
         <div class="card">
-            <h2 style="color: #006B3F; margin-bottom: 20px;">📋 Registered Users</h2>
+            <h3 style="margin-bottom: 20px;">Users</h3>
             <table>
                 <thead>
                     <tr>
                         <th>Username</th>
                         <th>Full Name</th>
-                        <th>Email</th>
                         <th>Role</th>
                         <th>Created</th>
                         <th>Actions</th>
@@ -823,15 +484,14 @@ USERS_HTML = """
                 <tbody>
                     {% for username, info in users.items() %}
                     <tr>
-                        <td><strong>{{ username }}</strong></td>
+                        <td>{{ username }}</td>
                         <td>{{ info.full_name }}</td>
-                        <td>{{ info.email }}</td>
-                        <td>{% if info.role == 'admin' %}👑 Admin{% else %}👤 User{% endif %}</td>
+                        <td>{{ info.role }}</td>
                         <td>{{ info.created_at[:10] }}</td>
                         <td>
-                            {% if username != current_user %}
+                            {% if username != current_user and username != 'getaye' %}
                             <form action="/users/delete/{{ username }}" method="POST" style="display:inline;">
-                                <button type="submit" class="btn btn-danger" onclick="return confirm('Delete user?')">Delete</button>
+                                <button type="submit" class="btn btn-danger" onclick="return confirm('Delete?')">Delete</button>
                             </form>
                             {% endif %}
                         </td>
@@ -849,276 +509,224 @@ INDEX_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AAU - Category Classifier | Getaye Fiseha</title>
+    <title>Image Classifier</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
             min-height: 100vh;
         }
         
-        .navbar { 
-            background: linear-gradient(135deg, #006B3F, #FCD116); 
-            padding: 15px 30px; 
-            color: white; 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            box-shadow: 0 4px 12px rgba(0,0,0,0.1); 
-        }
-        .nav-links a { 
-            color: white; 
-            text-decoration: none; 
-            margin-left: 20px; 
-            padding: 8px 16px; 
-            border-radius: 5px; 
-            transition: background 0.3s; 
-        }
-        .nav-links a:hover { 
-            background: rgba(255,255,255,0.2); 
-        }
-        .student-badge { 
-            background: #FCD116; 
-            color: #006B3F; 
-            padding: 5px 15px; 
-            border-radius: 20px; 
-            font-weight: bold; 
-        }
-        
-        .container { max-width: 1200px; margin: 40px auto; padding: 0 20px; }
-        
-        .hero {
-            text-align: center;
-            margin-bottom: 40px;
-        }
-        .hero h1 {
-            color: #006B3F;
-            font-size: 36px;
-        }
-        
-        .category-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-            margin-bottom: 30px;
-        }
-        
-        .category-card {
-            background: white;
-            padding: 20px;
-            border-radius: 15px;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
-            text-align: center;
-            font-size: 18px;
-            font-weight: bold;
-        }
-        
-        .main-card {
-            background: white;
-            border-radius: 20px;
-            padding: 40px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
-            margin-bottom: 30px;
-        }
-        
-        .upload-area { 
-            border: 3px dashed #006B3F; 
-            border-radius: 20px; 
-            padding: 60px; 
-            text-align: center; 
-            cursor: pointer; 
-            transition: all 0.3s; 
-            margin: 30px 0;
-            background: linear-gradient(135deg, #fff, #f8f9fa);
-        }
-        .upload-area:hover { 
-            border-color: #FCD116; 
-            background: #fff9e6;
-            transform: translateY(-5px);
-        }
-        .upload-area i { 
-            font-size: 64px; 
-            color: #006B3F; 
-            margin-bottom: 15px; 
-            display: block; 
-        }
-        
-        #preview { 
-            max-width: 100%; 
-            max-height: 400px; 
-            display: none; 
-            margin: 20px auto; 
-            border-radius: 15px; 
-            border: 4px solid #FCD116;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-        }
-        
-        .btn { 
-            background: linear-gradient(135deg, #006B3F, #FCD116); 
-            color: white; 
-            border: none; 
-            padding: 18px 40px; 
-            border-radius: 50px; 
-            font-size: 20px; 
-            font-weight: 600; 
-            cursor: pointer; 
-            transition: all 0.3s; 
-            width: 100%;
-            margin: 10px 0;
-        }
-        .btn:hover { 
-            transform: translateY(-3px); 
-            box-shadow: 0 15px 30px rgba(0,107,63,0.4);
-        }
-        
-        .results { 
-            margin-top: 40px; 
-            display: none; 
-        }
-        
-        .result-bar {
-            margin: 15px 0;
-            padding: 15px;
-            border-radius: 10px;
+        .navbar {
+            background: #006B3F;
+            padding: 15px 30px;
             color: white;
-            position: relative;
-            overflow: hidden;
-        }
-        
-        .result-bar-inner {
-            position: absolute;
-            top: 0;
-            left: 0;
-            height: 100%;
-            background: rgba(255,255,255,0.2);
-            transition: width 0.5s;
-            z-index: 1;
-        }
-        
-        .result-content {
-            position: relative;
-            z-index: 2;
             display: flex;
             justify-content: space-between;
             align-items: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
         }
         
-        .result-emoji {
-            font-size: 24px;
-            margin-right: 15px;
-        }
-        
-        .result-percentage {
-            font-size: 24px;
+        .user-info {
+            background: #FCD116;
+            color: #006B3F;
+            padding: 5px 15px;
+            border-radius: 20px;
             font-weight: bold;
         }
         
-        .training-section {
-            background: white;
-            border-radius: 20px;
-            padding: 30px;
-            margin-top: 30px;
+        .nav-links a {
+            color: white;
+            text-decoration: none;
+            margin-left: 20px;
         }
         
-        .category-badge {
-            display: inline-block;
-            padding: 10px 20px;
-            margin: 5px;
-            border-radius: 25px;
-            color: white;
+        .container {
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 0 20px;
+        }
+        
+        .upload-card {
+            background: white;
+            border-radius: 20px;
+            padding: 40px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        
+        .upload-area {
+            border: 3px dashed #006B3F;
+            border-radius: 20px;
+            padding: 60px 40px;
+            margin: 30px 0;
             cursor: pointer;
+            transition: all 0.3s;
+            background: #f8f9fa;
+        }
+        
+        .upload-area:hover {
+            border-color: #FCD116;
+            background: #fff9e6;
+            transform: translateY(-5px);
+        }
+        
+        .upload-icon {
+            font-size: 64px;
+            color: #006B3F;
+            margin-bottom: 15px;
+        }
+        
+        #preview {
+            max-width: 100%;
+            max-height: 400px;
+            display: none;
+            margin: 20px auto;
+            border-radius: 15px;
+            border: 4px solid #FCD116;
+        }
+        
+        .btn {
+            background: linear-gradient(135deg, #006B3F, #FCD116);
+            color: white;
+            border: none;
+            padding: 15px 40px;
+            border-radius: 50px;
+            font-size: 18px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
             transition: transform 0.3s;
         }
-        .category-badge:hover {
-            transform: scale(1.05);
+        
+        .btn:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 20px rgba(0,107,63,0.3);
         }
-        .category-badge.selected {
-            transform: scale(1.1);
-            box-shadow: 0 0 0 3px #FCD116;
+        
+        .results {
+            margin-top: 40px;
+            display: none;
+        }
+        
+        .prediction-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 20px;
+            margin: 10px 0;
+            background: #f8f9fa;
+            border-radius: 10px;
+            border-left: 8px solid #006B3F;
+            animation: slideIn 0.5s ease;
+        }
+        
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateX(-20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+        
+        .prediction-number {
+            background: #006B3F;
+            color: white;
+            width: 30px;
+            height: 30px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 15px;
+        }
+        
+        .prediction-name {
+            font-size: 20px;
+            font-weight: 600;
+            color: #333;
+        }
+        
+        .prediction-confidence {
+            background: #006B3F;
+            color: white;
+            padding: 8px 20px;
+            border-radius: 30px;
+            font-weight: bold;
+        }
+        
+        .spinner {
+            border: 5px solid #f3f3f3;
+            border-top: 5px solid #FCD116;
+            border-radius: 50%;
+            width: 50px;
+            height: 50px;
+            animation: spin 1s linear infinite;
+            margin: 30px auto;
+            display: none;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
         
         .footer {
-            background: #006B3F;
-            color: #FCD116;
-            padding: 20px;
             text-align: center;
             margin-top: 50px;
+            padding: 20px;
+            color: #666;
         }
     </style>
 </head>
 <body>
     <div class="navbar">
         <div>
-            <span class="student-badge">GSE/6132/18 | {{ session.full_name }}</span>
+            <span class="user-info">{{ session.full_name }} ({{ session.role }})</span>
         </div>
         <div class="nav-links">
             <a href="/">Home</a>
             {% if session.role == 'admin' %}
-            <a href="/users">👑 Manage Users</a>
+            <a href="/users">Manage Users</a>
             {% endif %}
             <a href="/logout">Logout</a>
         </div>
     </div>
     
     <div class="container">
-        <div class="hero">
-            <h1>🎯 High-Level Image Classifier</h1>
-            <p>Upload any image - I'll tell you which category it belongs to!</p>
-        </div>
-        
-        <div class="category-grid">
-            {% for cat_id, cat in categories.items() %}
-            <div class="category-card" style="border-left: 8px solid {{ cat.color }};">
-                {{ cat.emoji }} {{ cat.name }}
-            </div>
-            {% endfor %}
-        </div>
-        
-        <div class="main-card">
+        <div class="upload-card">
+            <h1 style="color: #006B3F; margin-bottom: 20px;">📸 Image Classifier</h1>
+            <p style="color: #666; margin-bottom: 30px;">Upload any image to identify objects</p>
+            
             <div class="upload-area" onclick="document.getElementById('fileInput').click()">
                 <input type="file" id="fileInput" accept="image/*" style="display: none;">
-                <i>📸</i>
-                <p style="font-size: 20px;">Click or drag image here</p>
+                <div class="upload-icon">📤</div>
+                <p style="font-size: 18px;">Click or drag image here</p>
                 <p style="color: #999;">JPG, PNG, JPEG (Max 16MB)</p>
             </div>
             
             <img id="preview" src="#" alt="Preview">
             
-            <div id="spinner" style="text-align: center; margin: 20px; display: none;">
-                <div style="border: 5px solid #f3f3f3; border-top: 5px solid #FCD116; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin: 0 auto;"></div>
-                <p style="margin-top: 10px;">Analyzing image...</p>
+            <div class="spinner" id="spinner"></div>
+            
+            <button class="btn" onclick="classifyImage()">🔍 Classify Image</button>
+            
+            <div class="results" id="results">
+                <h3 style="color: #006B3F; margin-bottom: 20px;">🎯 Detected Objects</h3>
+                <div id="predictionList"></div>
             </div>
-            
-            <button class="btn" onclick="classifyImage()">🔍 CLASSIFY IMAGE</button>
-            
-            <div id="results" class="results"></div>
         </div>
         
-        <div class="training-section" id="trainingSection" style="display: none;">
-            <h2 style="color: #006B3F; margin-bottom: 20px;">📚 Help Improve the Model</h2>
-            <p>Select the correct category for this image:</p>
-            <div id="trainingCategories" style="margin: 20px 0;"></div>
-            <button class="btn" onclick="submitTraining()" style="background: #4CAF50;">✓ Submit Training Sample</button>
+        <div class="footer">
+            <p>Getaye Fiseha (GSE/6132/18) - MSc Computer Science</p>
         </div>
     </div>
     
-    <div class="footer">
-        <p>Getaye Fiseha (GSE/6132/18) - MSc Computer Science, Network & Security</p>
-        <p>Addis Ababa University | COSC 6041 - Machine Learning</p>
-    </div>
-    
-    <style>@keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }</style>
-    
     <script>
-        let currentImageFile = null;
-        let selectedCategory = null;
-        let currentPredictions = null;
+        let currentFile = null;
         
         document.getElementById('fileInput').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (file) {
-                currentImageFile = file;
+                currentFile = file;
                 const reader = new FileReader();
                 reader.onload = function(e) {
                     document.getElementById('preview').src = e.target.result;
@@ -1129,17 +737,16 @@ INDEX_HTML = """
         });
 
         async function classifyImage() {
-            if (!currentImageFile) {
+            if (!currentFile) {
                 alert('Please select an image first');
                 return;
             }
             
             const formData = new FormData();
-            formData.append('file', currentImageFile);
+            formData.append('file', currentFile);
             
             document.getElementById('spinner').style.display = 'block';
             document.getElementById('results').style.display = 'none';
-            document.getElementById('trainingSection').style.display = 'none';
             
             try {
                 const response = await fetch('/predict', {
@@ -1151,8 +758,6 @@ INDEX_HTML = """
                 
                 if (data.success) {
                     displayResults(data.predictions);
-                    currentPredictions = data.predictions;
-                    showTrainingSection(data.predictions);
                 } else {
                     alert('Error: ' + data.error);
                 }
@@ -1165,113 +770,29 @@ INDEX_HTML = """
         
         function displayResults(predictions) {
             const resultsDiv = document.getElementById('results');
-            resultsDiv.innerHTML = '<h2 style="color: #006B3F; margin-bottom: 20px;">📊 Classification Results</h2>';
+            const predictionList = document.getElementById('predictionList');
             
-            predictions.forEach(pred => {
-                const barWidth = pred.confidence * 100;
-                const resultDiv = document.createElement('div');
-                resultDiv.className = 'result-bar';
-                resultDiv.style.backgroundColor = pred.color;
-                resultDiv.innerHTML = `
-                    <div class="result-bar-inner" style="width: ${barWidth}%;"></div>
-                    <div class="result-content">
-                        <div>
-                            <span class="result-emoji">${pred.emoji}</span>
-                            <span style="font-size: 18px;">${pred.category}</span>
-                        </div>
-                        <span class="result-percentage">${pred.probability}</span>
+            predictionList.innerHTML = '';
+            
+            predictions.forEach((pred, index) => {
+                const item = document.createElement('div');
+                item.className = 'prediction-item';
+                item.innerHTML = `
+                    <div style="display: flex; align-items: center;">
+                        <span class="prediction-number">${index + 1}</span>
+                        <span class="prediction-name">${pred.object}</span>
                     </div>
+                    <span class="prediction-confidence">${pred.percentage}</span>
                 `;
-                resultsDiv.appendChild(resultDiv);
+                predictionList.appendChild(item);
             });
-            
-            // Show top matches
-            const topPred = predictions[0];
-            if (topPred && topPred.top_matches && topPred.top_matches.length > 0) {
-                const detailsDiv = document.createElement('div');
-                detailsDiv.style.marginTop = '20px';
-                detailsDiv.style.padding = '15px';
-                detailsDiv.style.background = '#f8f9fa';
-                detailsDiv.style.borderRadius = '10px';
-                detailsDiv.innerHTML = `
-                    <p><strong>Top detected items in ${topPred.category}:</strong></p>
-                    <ul style="margin-left: 20px;">
-                        ${topPred.top_matches.map(m => `<li>${m.class} (${(m.confidence*100).toFixed(1)}%)</li>`).join('')}
-                    </ul>
-                `;
-                resultsDiv.appendChild(detailsDiv);
-            }
             
             resultsDiv.style.display = 'block';
-        }
-        
-        function showTrainingSection(predictions) {
-            const section = document.getElementById('trainingSection');
-            const categoriesDiv = document.getElementById('trainingCategories');
-            
-            categoriesDiv.innerHTML = '';
-            
-            predictions.forEach(pred => {
-                const badge = document.createElement('span');
-                badge.className = 'category-badge';
-                badge.style.backgroundColor = pred.color;
-                badge.textContent = `${pred.emoji} ${pred.category}`;
-                badge.onclick = () => selectTrainingCategory(pred.category_id, badge);
-                categoriesDiv.appendChild(badge);
-            });
-            
-            section.style.display = 'block';
-        }
-        
-        function selectTrainingCategory(categoryId, element) {
-            selectedCategory = categoryId;
-            document.querySelectorAll('.category-badge').forEach(el => {
-                el.classList.remove('selected');
-            });
-            element.classList.add('selected');
-        }
-        
-        async function submitTraining() {
-            if (!selectedCategory) {
-                alert('Please select a category');
-                return;
-            }
-            
-            if (!currentImageFile) {
-                alert('No image to train on');
-                return;
-            }
-            
-            const formData = new FormData();
-            formData.append('file', currentImageFile);
-            formData.append('category', selectedCategory);
-            
-            try {
-                const response = await fetch('/train', {
-                    method: 'POST',
-                    body: formData
-                });
-                
-                const data = await response.json();
-                
-                if (data.success) {
-                    alert('✅ Training sample added! Thank you for helping improve the model.');
-                    document.getElementById('trainingSection').style.display = 'none';
-                } else {
-                    alert('Error: ' + data.error);
-                }
-            } catch (error) {
-                alert('Error: ' + error.message);
-            }
         }
     </script>
 </body>
 </html>
 """
-
-# ============================================================================
-# Main Entry Point
-# ============================================================================
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000, debug=True)
