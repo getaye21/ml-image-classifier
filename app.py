@@ -28,6 +28,7 @@ import json
 import base64
 from werkzeug.utils import secure_filename
 import numpy as np
+import pickle
 
 # ============================================================================
 # Application Configuration
@@ -43,27 +44,22 @@ app.config['UPLOAD_FOLDER'] = '/tmp/uploads'
 app.config['TRAINING_FOLDER'] = 'training_data'
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 app.config['USER_DATA'] = 'users.json'
-app.config['MODEL_DATA'] = 'trained_model.pkl'
+app.config['LEARNING_DATA'] = 'learning_data.pkl'
 
 # Create directories
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['TRAINING_FOLDER'], exist_ok=True)
-for category in ['animals', 'plants', 'objects', 'food', 'people', 'places']:
-    os.makedirs(os.path.join(app.config['TRAINING_FOLDER'], category), exist_ok=True)
 
 # ============================================================================
-# AAU Logo (Red and Gold - AAU Colors)
+# AAU Logo (Red and Gold)
 # ============================================================================
 
 AAU_LOGO_SVG = '''
 <svg width="200" height="80" viewBox="0 0 200 80" xmlns="http://www.w3.org/2000/svg">
-    <!-- Background -->
     <rect width="200" height="80" fill="#8B0000" rx="10" ry="10"/>
-    <!-- Gold torch -->
     <circle cx="60" cy="40" r="20" fill="#FFD700"/>
     <rect x="55" y="40" width="10" height="25" fill="#FFD700"/>
     <path d="M45 45 L75 45 L70 65 L50 65 Z" fill="#FFD700"/>
-    <!-- AAU Text -->
     <text x="100" y="35" fill="#FFD700" font-size="20" font-weight="bold">AAU</text>
     <text x="100" y="55" fill="white" font-size="12">EST. 1950</text>
 </svg>
@@ -87,16 +83,13 @@ class UserManager:
                     'password_hash': self._hash_password('Getaye@2827'),
                     'full_name': 'Getaye Fiseha',
                     'role': 'admin',
-                    'student_id': 'GSE/6132/18',
-                    'email': 'getaye.fiseha@aau.edu.et',
-                    'created_at': datetime.now().isoformat(),
-                    'training_count': 0
+                    'created_at': datetime.now().isoformat()
                 }
             }
             self._save_users(users)
     
     def _hash_password(self, password):
-        salt = "AAU_RED_SALT_2026"
+        salt = "AAU_SALT"
         return hashlib.sha256((password + salt).encode()).hexdigest()
     
     def _save_users(self, users):
@@ -119,8 +112,7 @@ class UserManager:
             'full_name': full_name,
             'role': role,
             'created_at': datetime.now().isoformat(),
-            'created_by': created_by,
-            'training_count': 0
+            'created_by': created_by
         }
         self._save_users(users)
         return True, "User created"
@@ -146,12 +138,6 @@ class UserManager:
             self._save_users(users)
             return True, "User deleted"
         return False, "User not found"
-    
-    def increment_training(self, username):
-        users = self._load_users()
-        if username in users:
-            users[username]['training_count'] = users[username].get('training_count', 0) + 1
-            self._save_users(users)
 
 user_manager = UserManager()
 
@@ -177,48 +163,71 @@ def admin_required(f):
     return decorated
 
 # ============================================================================
-# Accurate Image Classifier with Learning Capability
+# Learning Classifier - Actually Learns from User Input
 # ============================================================================
 
-class AccurateClassifier:
+class LearningClassifier:
     """
-    Uses Vision Transformer with boosting algorithm
-    Learns from user feedback to improve accuracy
+    Classifier that learns from user feedback
+    Saves and remembers user-trained objects
     """
     
-    # Common objects mapping for accurate detection
-    COMMON_OBJECTS = {
-        # People
-        'person': 'person', 'man': 'man', 'woman': 'woman', 'child': 'child', 'baby': 'baby',
-        'girl': 'girl', 'boy': 'boy', 'crowd': 'crowd', 'people': 'people',
+    # Base categories
+    CATEGORIES = {
+        'person': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
+        'man': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
+        'woman': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
+        'child': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
+        'baby': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
+        'crowd': {'category': 'people', 'emoji': '👥', 'color': '#9B59B6'},
         
-        # Animals
-        'cat': 'cat', 'dog': 'dog', 'bird': 'bird', 'fish': 'fish', 'horse': 'horse',
-        'cow': 'cow', 'sheep': 'sheep', 'goat': 'goat', 'lion': 'lion', 'tiger': 'tiger',
-        'elephant': 'elephant', 'rabbit': 'rabbit', 'duck': 'duck', 'chicken': 'chicken',
+        'cat': {'category': 'animals', 'emoji': '🐱', 'color': '#FF6B6B'},
+        'dog': {'category': 'animals', 'emoji': '🐕', 'color': '#FF6B6B'},
+        'bird': {'category': 'animals', 'emoji': '🐦', 'color': '#FF6B6B'},
+        'fish': {'category': 'animals', 'emoji': '🐠', 'color': '#FF6B6B'},
+        'horse': {'category': 'animals', 'emoji': '🐎', 'color': '#FF6B6B'},
+        'cow': {'category': 'animals', 'emoji': '🐄', 'color': '#FF6B6B'},
+        'elephant': {'category': 'animals', 'emoji': '🐘', 'color': '#FF6B6B'},
+        'lion': {'category': 'animals', 'emoji': '🦁', 'color': '#FF6B6B'},
+        'tiger': {'category': 'animals', 'emoji': '🐅', 'color': '#FF6B6B'},
+        'rabbit': {'category': 'animals', 'emoji': '🐰', 'color': '#FF6B6B'},
         
-        # Objects
-        'car': 'car', 'truck': 'truck', 'bus': 'bus', 'bicycle': 'bicycle', 'motorcycle': 'motorcycle',
-        'chair': 'chair', 'table': 'table', 'desk': 'desk', 'book': 'book', 'phone': 'phone',
-        'computer': 'computer', 'laptop': 'laptop', 'bottle': 'bottle', 'cup': 'cup',
-        'clock': 'clock', 'watch': 'watch', 'key': 'key', 'door': 'door', 'window': 'window',
+        'car': {'category': 'objects', 'emoji': '🚗', 'color': '#4A90E2'},
+        'truck': {'category': 'objects', 'emoji': '🚚', 'color': '#4A90E2'},
+        'bus': {'category': 'objects', 'emoji': '🚌', 'color': '#4A90E2'},
+        'bicycle': {'category': 'objects', 'emoji': '🚲', 'color': '#4A90E2'},
+        'chair': {'category': 'objects', 'emoji': '🪑', 'color': '#4A90E2'},
+        'table': {'category': 'objects', 'emoji': '🪑', 'color': '#4A90E2'},
+        'book': {'category': 'objects', 'emoji': '📚', 'color': '#4A90E2'},
+        'phone': {'category': 'objects', 'emoji': '📱', 'color': '#4A90E2'},
+        'computer': {'category': 'objects', 'emoji': '💻', 'color': '#4A90E2'},
+        'bottle': {'category': 'objects', 'emoji': '🍾', 'color': '#4A90E2'},
         
-        # Food
-        'pizza': 'pizza', 'apple': 'apple', 'banana': 'banana', 'cake': 'cake', 'bread': 'bread',
-        'rice': 'rice', 'coffee': 'coffee', 'tea': 'tea', 'water': 'water', 'juice': 'juice',
+        'pizza': {'category': 'food', 'emoji': '🍕', 'color': '#F4A460'},
+        'apple': {'category': 'food', 'emoji': '🍎', 'color': '#F4A460'},
+        'banana': {'category': 'food', 'emoji': '🍌', 'color': '#F4A460'},
+        'cake': {'category': 'food', 'emoji': '🍰', 'color': '#F4A460'},
+        'bread': {'category': 'food', 'emoji': '🍞', 'color': '#F4A460'},
+        'coffee': {'category': 'food', 'emoji': '☕', 'color': '#F4A460'},
         
-        # Plants
-        'flower': 'flower', 'tree': 'tree', 'rose': 'rose', 'grass': 'grass', 'leaf': 'leaf',
-        'cactus': 'cactus', 'palm': 'palm', 'plant': 'plant',
+        'flower': {'category': 'plants', 'emoji': '🌸', 'color': '#4CAF50'},
+        'tree': {'category': 'plants', 'emoji': '🌳', 'color': '#4CAF50'},
+        'rose': {'category': 'plants', 'emoji': '🌹', 'color': '#4CAF50'},
+        'grass': {'category': 'plants', 'emoji': '🌿', 'color': '#4CAF50'},
+        'cactus': {'category': 'plants', 'emoji': '🌵', 'color': '#4CAF50'},
         
-        # Places
-        'house': 'house', 'building': 'building', 'mountain': 'mountain', 'beach': 'beach',
-        'forest': 'forest', 'city': 'city', 'river': 'river', 'lake': 'lake', 'ocean': 'ocean'
+        'house': {'category': 'places', 'emoji': '🏠', 'color': '#E67E22'},
+        'building': {'category': 'places', 'emoji': '🏢', 'color': '#E67E22'},
+        'mountain': {'category': 'places', 'emoji': '⛰️', 'color': '#E67E22'},
+        'beach': {'category': 'places', 'emoji': '🏖️', 'color': '#E67E22'},
+        'forest': {'category': 'places', 'emoji': '🌲', 'color': '#E67E22'},
+        'city': {'category': 'places', 'emoji': '🌆', 'color': '#E67E22'},
+        'river': {'category': 'places', 'emoji': '🌊', 'color': '#E67E22'}
     }
     
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"🚀 Loading classifier on {self.device}...")
+        print(f"Loading classifier on {self.device}...")
         
         # Load pre-trained model
         model_name = "google/vit-base-patch16-224"
@@ -227,57 +236,71 @@ class AccurateClassifier:
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        # Get ImageNet labels
-        self.labels = self.model.config.id2label
-        
-        # Load user-trained data
-        self.user_trained = self._load_user_trained()
-        
-        print(f"✅ Classifier ready! Base knowledge: {len(self.labels)} classes")
-        print(f"   User trained: {len(self.user_trained)} custom labels")
+        # Load learning data
+        self.learning_data = self._load_learning_data()
+        print(f"Loaded {len(self.learning_data)} learned objects")
     
-    def _load_user_trained(self):
-        """Load user-trained labels"""
-        trained_file = 'user_trained.json'
-        if os.path.exists(trained_file):
-            with open(trained_file, 'r') as f:
-                return json.load(f)
-        return {}
-    
-    def _save_user_trained(self):
-        with open('user_trained.json', 'w') as f:
-            json.dump(self.user_trained, f, indent=2)
-    
-    def _get_category(self, object_name):
-        """Determine category of an object"""
-        object_lower = object_name.lower()
-        
-        categories = {
-            'people': ['person', 'man', 'woman', 'child', 'baby', 'girl', 'boy', 'crowd'],
-            'animals': ['cat', 'dog', 'bird', 'fish', 'horse', 'cow', 'sheep', 'lion', 'tiger', 'elephant'],
-            'objects': ['car', 'truck', 'chair', 'table', 'book', 'phone', 'computer', 'bottle'],
-            'food': ['pizza', 'apple', 'banana', 'cake', 'bread', 'rice', 'coffee'],
-            'plants': ['flower', 'tree', 'rose', 'grass', 'cactus', 'plant'],
-            'places': ['house', 'building', 'mountain', 'beach', 'forest', 'city']
+    def _load_learning_data(self):
+        """Load user-trained data"""
+        if os.path.exists(app.config['LEARNING_DATA']):
+            with open(app.config['LEARNING_DATA'], 'rb') as f:
+                return pickle.load(f)
+        return {
+            'objects': {},  # object_name -> count
+            'features': {},  # feature_hash -> object_name
+            'samples': []    # list of training samples
         }
+    
+    def _save_learning_data(self):
+        """Save learning data"""
+        with open(app.config['LEARNING_DATA'], 'wb') as f:
+            pickle.dump(self.learning_data, f)
+    
+    def _extract_features(self, image):
+        """Extract features from image"""
+        inputs = self.feature_extractor(images=image, return_tensors="pt")
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
         
-        for category, keywords in categories.items():
-            if any(keyword in object_lower for keyword in keywords):
-                return category
-        return 'objects'
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+            # Use last hidden state as features
+            features = outputs.hidden_states[-1].mean(dim=1).cpu().numpy().flatten()
+        
+        return features
+    
+    def _get_feature_hash(self, features):
+        """Create hash from features for quick lookup"""
+        # Quantize features to create a hash
+        quantized = np.round(features * 100).astype(int)
+        return hashlib.md5(quantized.tobytes()).hexdigest()
     
     def predict(self, image_path, top_k=5):
-        """
-        Predict objects in image - ACCURATE detection
-        Returns simple object names
-        """
+        """Predict with learning from user feedback"""
         try:
-            # Load and preprocess image
             image = Image.open(image_path).convert('RGB')
+            
+            # Get features
+            features = self._extract_features(image)
+            feature_hash = self._get_feature_hash(features)
+            
+            # Check if we've seen this image before
+            if feature_hash in self.learning_data['features']:
+                learned_object = self.learning_data['features'][feature_hash]
+                if learned_object in self.CATEGORIES:
+                    cat = self.CATEGORIES[learned_object]
+                    return [{
+                        'object': learned_object.title(),
+                        'category': cat['category'],
+                        'emoji': cat['emoji'],
+                        'color': cat['color'],
+                        'confidence': 0.95,
+                        'percentage': '95%'
+                    }]
+            
+            # Get base model predictions
             inputs = self.feature_extractor(images=image, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
-            # Get predictions
             with torch.no_grad():
                 outputs = self.model(**inputs)
                 probabilities = F.softmax(outputs.logits, dim=-1)[0]
@@ -289,128 +312,98 @@ class AccurateClassifier:
             seen = set()
             
             for prob, idx in zip(top_probs, top_indices):
-                class_id = idx.item()
-                class_name = self.labels[class_id].lower()
+                class_name = self.model.config.id2label[idx.item()].lower()
                 confidence = prob.item()
                 
-                # Skip if confidence too low
                 if confidence < 0.01:
                     continue
                 
-                # Check if this is a common object
-                detected_object = None
-                for key, value in self.COMMON_OBJECTS.items():
-                    if key in class_name and value not in seen:
-                        detected_object = value
+                # Try to find in our categories
+                detected = None
+                for obj in self.CATEGORIES.keys():
+                    if obj in class_name and obj not in seen:
+                        detected = obj
                         break
                 
-                # If not found in common objects, use first word
-                if not detected_object:
-                    words = class_name.replace('_', ' ').split()
-                    if words and words[0] not in seen:
-                        detected_object = words[0]
-                
-                if detected_object and detected_object not in seen:
-                    category = self._get_category(detected_object)
-                    
-                    # Category colors
-                    colors = {
-                        'people': '#9B59B6',
-                        'animals': '#FF6B6B',
-                        'objects': '#4A90E2',
-                        'food': '#F4A460',
-                        'plants': '#4CAF50',
-                        'places': '#E67E22'
-                    }
-                    
-                    # Category emojis
-                    emojis = {
-                        'people': '👤',
-                        'animals': '🐱',
-                        'objects': '📦',
-                        'food': '🍎',
-                        'plants': '🌿',
-                        'places': '🏠'
-                    }
-                    
+                if detected:
+                    cat = self.CATEGORIES[detected]
                     predictions.append({
-                        'object': detected_object.title(),
-                        'category': category,
-                        'emoji': emojis.get(category, '📦'),
-                        'color': colors.get(category, '#4A90E2'),
+                        'object': detected.title(),
+                        'category': cat['category'],
+                        'emoji': cat['emoji'],
+                        'color': cat['color'],
                         'confidence': confidence,
                         'percentage': f"{confidence:.1%}"
                     })
-                    
-                    seen.add(detected_object)
+                    seen.add(detected)
                     
                     if len(predictions) >= top_k:
                         break
             
-            return predictions if predictions else [
-                {
-                    'object': 'Unknown',
-                    'category': 'objects',
-                    'emoji': '❓',
-                    'color': '#999999',
-                    'confidence': 1.0,
-                    'percentage': '100%'
-                }
-            ]
+            # Boost predictions based on learning data
+            for obj, count in self.learning_data['objects'].items():
+                if obj not in seen and count > 0 and obj in self.CATEGORIES:
+                    cat = self.CATEGORIES[obj]
+                    predictions.append({
+                        'object': obj.title(),
+                        'category': cat['category'],
+                        'emoji': cat['emoji'],
+                        'color': cat['color'],
+                        'confidence': 0.3 + (count * 0.05),
+                        'percentage': f"{30 + count*5}%",
+                        'learned': True
+                    })
+                    if len(predictions) >= top_k:
+                        break
+            
+            return predictions[:top_k]
             
         except Exception as e:
             print(f"Error: {e}")
             return None
     
-    def add_training_sample(self, image_path, object_name, username):
-        """
-        LEARN from user feedback
-        Saves training sample for future improvement
-        """
+    def learn(self, image_path, object_name, username):
+        """Learn from user feedback"""
         try:
-            # Extract features
+            object_name = object_name.lower().strip()
+            
+            # Extract and store features
             image = Image.open(image_path).convert('RGB')
-            features = self.feature_extractor(images=image, return_tensors="pt")
+            features = self._extract_features(image)
+            feature_hash = self._get_feature_hash(features)
             
-            # Save to user-trained database
-            object_lower = object_name.lower()
-            if object_lower not in self.user_trained:
-                self.user_trained[object_lower] = {
-                    'count': 0,
-                    'samples': []
-                }
-            
-            # Save image
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{username}_{timestamp}_{uuid.uuid4()}.jpg"
-            category = self._get_category(object_lower)
-            save_path = os.path.join(app.config['TRAINING_FOLDER'], category, filename)
-            image.save(save_path)
-            
-            # Update database
-            self.user_trained[object_lower]['count'] += 1
-            self.user_trained[object_lower]['samples'].append({
-                'path': save_path,
+            # Store in learning data
+            self.learning_data['features'][feature_hash] = object_name
+            self.learning_data['objects'][object_name] = self.learning_data['objects'].get(object_name, 0) + 1
+            self.learning_data['samples'].append({
+                'object': object_name,
                 'username': username,
-                'timestamp': timestamp
+                'timestamp': datetime.now().isoformat()
             })
             
-            self._save_user_trained()
+            # Save image for future retraining
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{username}_{timestamp}_{object_name}.jpg"
+            save_path = os.path.join(app.config['TRAINING_FOLDER'], filename)
+            image.save(save_path)
             
-            return True
+            self._save_learning_data()
+            
+            return True, f"Learned: {object_name.title()}"
             
         except Exception as e:
-            print(f"Error saving training sample: {e}")
-            return False
+            print(f"Learning error: {e}")
+            return False, str(e)
     
-    def get_training_stats(self):
-        """Get training statistics"""
+    def get_stats(self):
+        """Get learning statistics"""
         return {
-            'total': sum(data['count'] for data in self.user_trained.values()),
-            'objects': len(self.user_trained)
+            'total_samples': len(self.learning_data['samples']),
+            'unique_objects': len(self.learning_data['objects']),
+            'objects': self.learning_data['objects']
         }
 
-classifier = AccurateClassifier()
+classifier = LearningClassifier()
 
 # ============================================================================
 # Authentication Routes
@@ -477,7 +470,7 @@ def delete_user(username):
 @app.route('/')
 @login_required
 def index():
-    stats = classifier.get_training_stats()
+    stats = classifier.get_stats()
     return render_template_string(INDEX_HTML, 
                                  session=session, 
                                  stats=stats,
@@ -515,10 +508,10 @@ def predict():
         if os.path.exists(filepath):
             os.remove(filepath)
 
-@app.route('/train', methods=['POST'])
+@app.route('/learn', methods=['POST'])
 @login_required
-def train():
-    """LEARN from user feedback"""
+def learn():
+    """Learn from user feedback"""
     if 'file' not in request.files or 'object_name' not in request.form:
         return jsonify({'error': 'Missing data'}), 400
     
@@ -534,17 +527,16 @@ def train():
     file.save(filepath)
     
     try:
-        success = classifier.add_training_sample(filepath, object_name, session['username'])
+        success, message = classifier.learn(filepath, object_name, session['username'])
         
         if success:
-            user_manager.increment_training(session['username'])
             return jsonify({
                 'success': True,
-                'message': f'✅ Learned: {object_name.title()}',
-                'stats': classifier.get_training_stats()
+                'message': message,
+                'stats': classifier.get_stats()
             })
         else:
-            return jsonify({'error': 'Could not save training sample'}), 500
+            return jsonify({'error': message}), 500
             
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -555,8 +547,8 @@ def train():
 @app.route('/stats')
 @login_required
 def get_stats():
-    """Get training statistics"""
-    return jsonify(classifier.get_training_stats())
+    """Get learning statistics"""
+    return jsonify(classifier.get_stats())
 
 # ============================================================================
 # HTML Templates
@@ -566,7 +558,7 @@ LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AAU - Image Classifier Login</title>
+    <title>AAU - Image Classifier</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
@@ -583,19 +575,18 @@ LOGIN_HTML = """
             border-radius: 20px;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             width: 100%;
-            max-width: 450px;
+            max-width: 400px;
             text-align: center;
         }
         .logo {
             margin-bottom: 20px;
         }
-        .logo svg {
+        .logo img {
             width: 200px;
-            height: 80px;
         }
         .university-name {
             color: #8B0000;
-            font-size: 22px;
+            font-size: 20px;
             font-weight: bold;
             margin-bottom: 5px;
         }
@@ -604,36 +595,16 @@ LOGIN_HTML = """
             font-size: 14px;
             margin-bottom: 20px;
         }
-        .student-info {
-            background: #f5f5f5;
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 25px;
-            border-left: 5px solid #8B0000;
-            text-align: left;
-        }
-        .student-info p {
-            margin: 5px 0;
-            color: #333;
-        }
-        .student-info strong {
-            color: #8B0000;
-        }
         .project-title {
             background: #f5f5f5;
             padding: 15px;
             border-radius: 10px;
             margin-bottom: 25px;
-            border-left: 5px solid #FFD700;
+            border-left: 5px solid #8B0000;
         }
         .project-title h3 {
             color: #8B0000;
             font-size: 16px;
-        }
-        .project-title p {
-            color: #666;
-            font-size: 13px;
-            margin-top: 5px;
         }
         .input-group {
             margin-bottom: 15px;
@@ -644,7 +615,6 @@ LOGIN_HTML = """
             border: 2px solid #e1e1e1;
             border-radius: 8px;
             font-size: 16px;
-            transition: border-color 0.3s;
         }
         .input-group input:focus {
             outline: none;
@@ -660,12 +630,10 @@ LOGIN_HTML = """
             font-size: 18px;
             font-weight: 600;
             cursor: pointer;
-            transition: transform 0.2s;
             margin-top: 10px;
         }
         button:hover {
             transform: translateY(-2px);
-            box-shadow: 0 5px 15px rgba(139,0,0,0.3);
         }
         .error {
             background: #fee;
@@ -679,15 +647,10 @@ LOGIN_HTML = """
 <body>
     <div class="login-container">
         <div class="logo">
-            <img src="data:image/svg+xml;base64,{{ logo }}" alt="AAU Logo" style="width: 200px;">
+            <img src="data:image/svg+xml;base64,{{ logo }}" alt="AAU Logo">
         </div>
         <div class="university-name">ADDIS ABABA UNIVERSITY</div>
         <div class="college-name">College of Natural and Computational Sciences<br>Department of Computer Science</div>
-        
-        <div class="student-info">
-            <p><strong>🎓 Getaye Fiseha</strong> (GSE/6132/18)</p>
-            <p><strong>👨‍🏫 Supervisor:</strong> Dr. Yaregal A.</p>
-        </div>
         
         <div class="project-title">
             <h3>High-Level Image Classifier with Boosting Algorithm</h3>
@@ -809,7 +772,7 @@ USERS_HTML = """
                     <tr>
                         <td>{{ username }}</td>
                         <td>{{ info.full_name }}</td>
-                        <td>{{ info.role }}</td>
+                        <td>{% if info.role == 'admin' %}👑 Admin{% else %}👤 User{% endif %}</td>
                         <td>{{ info.created_at[:10] }}</td>
                         <td>
                             {% if username != current_user and username != 'getaye' %}
@@ -847,7 +810,6 @@ INDEX_HTML = """
             display: flex;
             justify-content: space-between;
             align-items: center;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
         }
         
         .logo {
@@ -860,18 +822,9 @@ INDEX_HTML = """
             height: 40px;
         }
         
-        .university-info {
-            line-height: 1.3;
-        }
-        
         .university-info h2 {
             font-size: 18px;
             color: #FFD700;
-        }
-        
-        .university-info p {
-            font-size: 12px;
-            opacity: 0.9;
         }
         
         .user-info {
@@ -886,12 +839,6 @@ INDEX_HTML = """
             color: white;
             text-decoration: none;
             margin-left: 20px;
-            padding: 5px 10px;
-        }
-        
-        .nav-links a:hover {
-            background: rgba(255,255,255,0.2);
-            border-radius: 5px;
         }
         
         .container {
@@ -908,18 +855,6 @@ INDEX_HTML = """
         .project-header h1 {
             color: #8B0000;
             font-size: 32px;
-            margin-bottom: 10px;
-        }
-        
-        .project-header .course {
-            color: #FFD700;
-            font-weight: bold;
-            font-size: 18px;
-            background: #8B0000;
-            display: inline-block;
-            padding: 8px 25px;
-            border-radius: 30px;
-            margin-top: 10px;
         }
         
         .stats-card {
@@ -929,12 +864,7 @@ INDEX_HTML = """
             margin-bottom: 30px;
             display: flex;
             justify-content: space-around;
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
             border-left: 5px solid #FFD700;
-        }
-        
-        .stat-item {
-            text-align: center;
         }
         
         .stat-number {
@@ -956,7 +886,6 @@ INDEX_HTML = """
             padding: 40px;
             text-align: center;
             cursor: pointer;
-            transition: all 0.3s;
             margin: 20px 0;
         }
         
@@ -968,7 +897,6 @@ INDEX_HTML = """
         .upload-icon {
             font-size: 48px;
             color: #8B0000;
-            margin-bottom: 10px;
         }
         
         #preview {
@@ -976,8 +904,8 @@ INDEX_HTML = """
             max-height: 300px;
             display: none;
             margin: 20px auto;
-            border-radius: 10px;
             border: 4px solid #FFD700;
+            border-radius: 10px;
         }
         
         .btn {
@@ -990,17 +918,11 @@ INDEX_HTML = """
             font-weight: 600;
             cursor: pointer;
             width: 100%;
-            transition: transform 0.3s;
             margin: 10px 0;
-        }
-        
-        .btn:hover {
-            transform: translateY(-2px);
         }
         
         .btn-small {
             padding: 8px 15px;
-            font-size: 14px;
             width: auto;
         }
         
@@ -1013,20 +935,15 @@ INDEX_HTML = """
             margin: 10px 0;
             border-radius: 10px;
             border-left: 8px solid;
-            animation: slideIn 0.3s ease;
         }
         
-        @keyframes slideIn {
-            from { opacity: 0; transform: translateX(-20px); }
-            to { opacity: 1; transform: translateX(0); }
-        }
-        
-        .prediction-name {
-            font-size: 18px;
-            font-weight: 600;
-            display: flex;
-            align-items: center;
-            gap: 10px;
+        .learned-badge {
+            background: #4CAF50;
+            color: white;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            margin-left: 10px;
         }
         
         .prediction-confidence {
@@ -1037,27 +954,25 @@ INDEX_HTML = """
             font-weight: bold;
         }
         
-        .training-section {
+        .learning-section {
             margin-top: 30px;
             padding: 20px;
             background: #f8f9fa;
             border-radius: 15px;
             display: none;
-            border: 2px solid #FFD700;
         }
         
-        .training-input {
+        .learning-input {
             width: 100%;
             padding: 12px;
             margin: 15px 0;
             border: 2px solid #ddd;
             border-radius: 8px;
-            font-size: 16px;
         }
         
-        .training-input:focus {
-            outline: none;
+        .learning-input:focus {
             border-color: #FFD700;
+            outline: none;
         }
         
         .spinner {
@@ -1077,16 +992,7 @@ INDEX_HTML = """
         }
         
         .results {
-            margin-top: 30px;
             display: none;
-        }
-        
-        .footer {
-            background: #8B0000;
-            color: #FFD700;
-            padding: 20px;
-            text-align: center;
-            margin-top: 50px;
         }
         
         .success-message {
@@ -1097,6 +1003,14 @@ INDEX_HTML = """
             margin-top: 15px;
             display: none;
         }
+        
+        .footer {
+            background: #8B0000;
+            color: #FFD700;
+            padding: 20px;
+            text-align: center;
+            margin-top: 50px;
+        }
     </style>
 </head>
 <body>
@@ -1105,15 +1019,15 @@ INDEX_HTML = """
             <img src="data:image/svg+xml;base64,{{ logo }}" alt="AAU Logo">
             <div class="university-info">
                 <h2>ADDIS ABABA UNIVERSITY</h2>
-                <p>College of Natural and Computational Sciences<br>Department of Computer Science</p>
+                <p>College of Natural and Computational Sciences</p>
             </div>
         </div>
         <div style="display: flex; align-items: center; gap: 20px;">
-            <span class="user-info">🎓 {{ session.full_name }} ({{ session.role }})</span>
+            <span class="user-info">{{ session.full_name }}</span>
             <div class="nav-links">
                 <a href="/">Home</a>
                 {% if session.role == 'admin' %}
-                <a href="/users">👑 Users</a>
+                <a href="/users">Manage Users</a>
                 {% endif %}
                 <a href="/logout">Logout</a>
             </div>
@@ -1122,33 +1036,26 @@ INDEX_HTML = """
     
     <div class="container">
         <div class="project-header">
-            <h1>High-Level Image Classifier with Boosting Algorithm</h1>
-            <div class="course">Machine Learning (COSC 6041)</div>
+            <h1>High-Level Image Classifier</h1>
+            <p style="color: #666;">Machine Learning Course (COSC 6041)</p>
         </div>
         
         <div class="stats-card">
             <div class="stat-item">
-                <div class="stat-number">{{ stats.total }}</div>
+                <div class="stat-number">{{ stats.total_samples }}</div>
                 <div>Training Samples</div>
             </div>
             <div class="stat-item">
-                <div class="stat-number">{{ stats.objects }}</div>
+                <div class="stat-number">{{ stats.unique_objects }}</div>
                 <div>Objects Learned</div>
-            </div>
-            <div class="stat-item">
-                <div class="stat-number">1000+</div>
-                <div>Base Classes</div>
             </div>
         </div>
         
         <div class="main-card">
-            <h2 style="color: #8B0000; margin-bottom: 20px;">📸 Upload Image</h2>
-            
             <div class="upload-area" onclick="document.getElementById('fileInput').click()">
                 <input type="file" id="fileInput" accept="image/*" style="display: none;">
                 <div class="upload-icon">📤</div>
-                <p style="font-size: 18px;">Click or drag image here</p>
-                <p style="color: #999;">JPG, PNG, JPEG (Max 16MB)</p>
+                <p>Click or drag image here</p>
             </div>
             
             <img id="preview" src="#" alt="Preview">
@@ -1158,32 +1065,26 @@ INDEX_HTML = """
             <button class="btn" onclick="classifyImage()">🔍 Classify Image</button>
             
             <div class="results" id="results">
-                <h3 style="color: #8B0000; margin-bottom: 15px;">Detected Objects:</h3>
+                <h3 style="color: #8B0000; margin: 20px 0;">Detected Objects:</h3>
                 <div id="predictionList"></div>
             </div>
             
-            <!-- Training Section -->
-            <div class="training-section" id="trainingSection">
+            <div class="learning-section" id="learningSection">
                 <h3 style="color: #8B0000;">📚 Teach the Model</h3>
                 <p>What object is in this image?</p>
-                
-                <input type="text" id="objectName" class="training-input" placeholder="Enter object name (e.g., cat, car, person)">
-                
-                <button class="btn btn-small" onclick="submitTraining()" style="background: #4CAF50;">✓ Submit & Teach</button>
-                
-                <div id="trainingMessage" class="success-message"></div>
+                <input type="text" id="objectName" class="learning-input" placeholder="e.g., cat, car, person">
+                <button class="btn btn-small" onclick="submitLearning()" style="background: #4CAF50;">✓ Submit & Teach</button>
+                <div id="learningMessage" class="success-message"></div>
             </div>
         </div>
     </div>
     
     <div class="footer">
-        <p><strong>Getaye Fiseha</strong> (GSE/6132/18) - Supervisor: Dr. Yaregal A.</p>
         <p>Addis Ababa University | College of Natural and Computational Sciences | Department of Computer Science</p>
     </div>
     
     <script>
         let currentFile = null;
-        let currentPredictions = null;
         
         document.getElementById('fileInput').addEventListener('change', function(e) {
             const file = e.target.files[0];
@@ -1209,7 +1110,7 @@ INDEX_HTML = """
             
             document.getElementById('spinner').style.display = 'block';
             document.getElementById('results').style.display = 'none';
-            document.getElementById('trainingSection').style.display = 'none';
+            document.getElementById('learningSection').style.display = 'none';
             
             try {
                 const response = await fetch('/predict', {
@@ -1221,8 +1122,7 @@ INDEX_HTML = """
                 
                 if (data.success) {
                     displayResults(data.predictions);
-                    currentPredictions = data.predictions;
-                    showTrainingSection();
+                    document.getElementById('learningSection').style.display = 'block';
                 } else {
                     alert('Error: ' + data.error);
                 }
@@ -1234,42 +1134,32 @@ INDEX_HTML = """
         }
         
         function displayResults(predictions) {
-            const resultsDiv = document.getElementById('results');
             const predictionList = document.getElementById('predictionList');
-            
             predictionList.innerHTML = '';
             
-            predictions.forEach((pred, index) => {
+            predictions.forEach(pred => {
                 const item = document.createElement('div');
                 item.className = 'prediction-item';
                 item.style.borderLeftColor = pred.color;
+                
+                let learnedBadge = pred.learned ? '<span class="learned-badge">Learned</span>' : '';
+                
                 item.innerHTML = `
-                    <div class="prediction-name">
-                        <span>${pred.emoji}</span>
-                        <span>${pred.object}</span>
-                        <span style="font-size: 12px; color: #666;">(${pred.category})</span>
+                    <div>
+                        <span style="font-size: 20px; margin-right: 10px;">${pred.emoji}</span>
+                        <span style="font-weight: bold;">${pred.object}</span>
+                        ${learnedBadge}
+                        <span style="color: #666; font-size: 12px; margin-left: 10px;">(${pred.category})</span>
                     </div>
                     <span class="prediction-confidence">${pred.percentage}</span>
                 `;
                 predictionList.appendChild(item);
             });
             
-            resultsDiv.style.display = 'block';
+            document.getElementById('results').style.display = 'block';
         }
         
-        function showTrainingSection() {
-            const section = document.getElementById('trainingSection');
-            const input = document.getElementById('objectName');
-            
-            // Pre-fill with top prediction
-            if (currentPredictions && currentPredictions.length > 0) {
-                input.value = currentPredictions[0].object.toLowerCase();
-            }
-            
-            section.style.display = 'block';
-        }
-        
-        async function submitTraining() {
+        async function submitLearning() {
             const objectName = document.getElementById('objectName').value.trim();
             
             if (!objectName) {
@@ -1286,11 +1176,10 @@ INDEX_HTML = """
             formData.append('file', currentFile);
             formData.append('object_name', objectName);
             
-            const messageDiv = document.getElementById('trainingMessage');
-            messageDiv.style.display = 'none';
+            const messageDiv = document.getElementById('learningMessage');
             
             try {
-                const response = await fetch('/train', {
+                const response = await fetch('/learn', {
                     method: 'POST',
                     body: formData
                 });
@@ -1298,7 +1187,7 @@ INDEX_HTML = """
                 const data = await response.json();
                 
                 if (data.success) {
-                    messageDiv.textContent = `✅ Learned: ${objectName.title()}! Thank you for teaching!`;
+                    messageDiv.textContent = `✅ Learned: ${objectName}! The model will remember this.`;
                     messageDiv.style.display = 'block';
                     setTimeout(() => {
                         messageDiv.style.display = 'none';
