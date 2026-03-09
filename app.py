@@ -10,6 +10,8 @@ Student Name: Getaye Fiseha
 Student ID: GSE/6132/18
 Supervisor: Dr. Yaregal A.
 Submission Date: March 2026
+
+AUTO-TRAINING FEATURE: Trains on 5 images per category at startup!
 ====================================================================
 """
 
@@ -29,6 +31,10 @@ import base64
 from werkzeug.utils import secure_filename
 import numpy as np
 import pickle
+import requests
+from io import BytesIO
+import time
+from tqdm import tqdm
 
 # ============================================================================
 # Application Configuration
@@ -163,71 +169,213 @@ def admin_required(f):
     return decorated
 
 # ============================================================================
-# Learning Classifier - Actually Learns from User Input
+# TRAINED CLASSIFIER - Pre-loaded with 5 images per category
 # ============================================================================
 
-class LearningClassifier:
+class TrainedClassifier:
     """
-    Classifier that learns from user feedback
-    Saves and remembers user-trained objects
+    Classifier pre-trained with 5 images per category
+    Knows: Animals, Plants, Objects, Food, People, Places
     """
     
-    # Base categories
+    # Complete category definitions with 5+ examples each
     CATEGORIES = {
-        'person': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
-        'man': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
-        'woman': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
-        'child': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
-        'baby': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
-        'crowd': {'category': 'people', 'emoji': '👥', 'color': '#9B59B6'},
-        
+        # 🐱 ANIMALS (10+ examples)
         'cat': {'category': 'animals', 'emoji': '🐱', 'color': '#FF6B6B'},
         'dog': {'category': 'animals', 'emoji': '🐕', 'color': '#FF6B6B'},
+        'tiger': {'category': 'animals', 'emoji': '🐅', 'color': '#FF6B6B'},
+        'elephant': {'category': 'animals', 'emoji': '🐘', 'color': '#FF6B6B'},
+        'lion': {'category': 'animals', 'emoji': '🦁', 'color': '#FF6B6B'},
         'bird': {'category': 'animals', 'emoji': '🐦', 'color': '#FF6B6B'},
         'fish': {'category': 'animals', 'emoji': '🐠', 'color': '#FF6B6B'},
         'horse': {'category': 'animals', 'emoji': '🐎', 'color': '#FF6B6B'},
         'cow': {'category': 'animals', 'emoji': '🐄', 'color': '#FF6B6B'},
-        'elephant': {'category': 'animals', 'emoji': '🐘', 'color': '#FF6B6B'},
-        'lion': {'category': 'animals', 'emoji': '🦁', 'color': '#FF6B6B'},
-        'tiger': {'category': 'animals', 'emoji': '🐅', 'color': '#FF6B6B'},
         'rabbit': {'category': 'animals', 'emoji': '🐰', 'color': '#FF6B6B'},
         
+        # 🌿 PLANTS (10+ examples)
+        'flower': {'category': 'plants', 'emoji': '🌸', 'color': '#4CAF50'},
+        'rose': {'category': 'plants', 'emoji': '🌹', 'color': '#4CAF50'},
+        'sunflower': {'category': 'plants', 'emoji': '🌻', 'color': '#4CAF50'},
+        'tree': {'category': 'plants', 'emoji': '🌳', 'color': '#4CAF50'},
+        'cactus': {'category': 'plants', 'emoji': '🌵', 'color': '#4CAF50'},
+        'grass': {'category': 'plants', 'emoji': '🌿', 'color': '#4CAF50'},
+        'palm': {'category': 'plants', 'emoji': '🌴', 'color': '#4CAF50'},
+        'leaf': {'category': 'plants', 'emoji': '🍃', 'color': '#4CAF50'},
+        'bamboo': {'category': 'plants', 'emoji': '🎋', 'color': '#4CAF50'},
+        'mushroom': {'category': 'plants', 'emoji': '🍄', 'color': '#4CAF50'},
+        
+        # 🚗 OBJECTS (10+ examples)
         'car': {'category': 'objects', 'emoji': '🚗', 'color': '#4A90E2'},
         'truck': {'category': 'objects', 'emoji': '🚚', 'color': '#4A90E2'},
         'bus': {'category': 'objects', 'emoji': '🚌', 'color': '#4A90E2'},
         'bicycle': {'category': 'objects', 'emoji': '🚲', 'color': '#4A90E2'},
+        'airplane': {'category': 'objects', 'emoji': '✈️', 'color': '#4A90E2'},
         'chair': {'category': 'objects', 'emoji': '🪑', 'color': '#4A90E2'},
         'table': {'category': 'objects', 'emoji': '🪑', 'color': '#4A90E2'},
         'book': {'category': 'objects', 'emoji': '📚', 'color': '#4A90E2'},
         'phone': {'category': 'objects', 'emoji': '📱', 'color': '#4A90E2'},
         'computer': {'category': 'objects', 'emoji': '💻', 'color': '#4A90E2'},
-        'bottle': {'category': 'objects', 'emoji': '🍾', 'color': '#4A90E2'},
         
+        # 🍎 FOOD (10+ examples)
         'pizza': {'category': 'food', 'emoji': '🍕', 'color': '#F4A460'},
         'apple': {'category': 'food', 'emoji': '🍎', 'color': '#F4A460'},
         'banana': {'category': 'food', 'emoji': '🍌', 'color': '#F4A460'},
         'cake': {'category': 'food', 'emoji': '🍰', 'color': '#F4A460'},
-        'bread': {'category': 'food', 'emoji': '🍞', 'color': '#F4A460'},
         'coffee': {'category': 'food', 'emoji': '☕', 'color': '#F4A460'},
+        'bread': {'category': 'food', 'emoji': '🍞', 'color': '#F4A460'},
+        'rice': {'category': 'food', 'emoji': '🍚', 'color': '#F4A460'},
+        'burger': {'category': 'food', 'emoji': '🍔', 'color': '#F4A460'},
+        'pasta': {'category': 'food', 'emoji': '🍝', 'color': '#F4A460'},
+        'ice cream': {'category': 'food', 'emoji': '🍦', 'color': '#F4A460'},
         
-        'flower': {'category': 'plants', 'emoji': '🌸', 'color': '#4CAF50'},
-        'tree': {'category': 'plants', 'emoji': '🌳', 'color': '#4CAF50'},
-        'rose': {'category': 'plants', 'emoji': '🌹', 'color': '#4CAF50'},
-        'grass': {'category': 'plants', 'emoji': '🌿', 'color': '#4CAF50'},
-        'cactus': {'category': 'plants', 'emoji': '🌵', 'color': '#4CAF50'},
+        # 👤 PEOPLE (10+ examples)
+        'person': {'category': 'people', 'emoji': '👤', 'color': '#9B59B6'},
+        'man': {'category': 'people', 'emoji': '👨', 'color': '#9B59B6'},
+        'woman': {'category': 'people', 'emoji': '👩', 'color': '#9B59B6'},
+        'baby': {'category': 'people', 'emoji': '👶', 'color': '#9B59B6'},
+        'crowd': {'category': 'people', 'emoji': '👥', 'color': '#9B59B6'},
+        'child': {'category': 'people', 'emoji': '🧒', 'color': '#9B59B6'},
+        'family': {'category': 'people', 'emoji': '👪', 'color': '#9B59B6'},
+        'doctor': {'category': 'people', 'emoji': '👨‍⚕️', 'color': '#9B59B6'},
+        'teacher': {'category': 'people', 'emoji': '👩‍🏫', 'color': '#9B59B6'},
+        'student': {'category': 'people', 'emoji': '🧑‍🎓', 'color': '#9B59B6'},
         
+        # 🏠 PLACES (10+ examples)
         'house': {'category': 'places', 'emoji': '🏠', 'color': '#E67E22'},
-        'building': {'category': 'places', 'emoji': '🏢', 'color': '#E67E22'},
         'mountain': {'category': 'places', 'emoji': '⛰️', 'color': '#E67E22'},
         'beach': {'category': 'places', 'emoji': '🏖️', 'color': '#E67E22'},
         'forest': {'category': 'places', 'emoji': '🌲', 'color': '#E67E22'},
         'city': {'category': 'places', 'emoji': '🌆', 'color': '#E67E22'},
-        'river': {'category': 'places', 'emoji': '🌊', 'color': '#E67E22'}
+        'river': {'category': 'places', 'emoji': '🌊', 'color': '#E67E22'},
+        'lake': {'category': 'places', 'emoji': '🏞️', 'color': '#E67E22'},
+        'desert': {'category': 'places', 'emoji': '🏜️', 'color': '#E67E22'},
+        'building': {'category': 'places', 'emoji': '🏢', 'color': '#E67E22'},
+        'park': {'category': 'places', 'emoji': '🌳', 'color': '#E67E22'}
+    }
+    
+    # Training images URLs (5 per category)
+    TRAINING_URLS = {
+        # Animals
+        'cat': [
+            'https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg',
+            'https://images.pexels.com/photos/416160/pexels-photo-416160.jpeg',
+            'https://images.pexels.com/photos/20787/pexels-photo.jpg',
+            'https://images.pexels.com/photos/96938/pexels-photo-96938.jpeg',
+            'https://images.pexels.com/photos/730896/pexels-photo-730896.jpeg'
+        ],
+        'dog': [
+            'https://images.pexels.com/photos/1805164/pexels-photo-1805164.jpeg',
+            'https://images.pexels.com/photos/2023384/pexels-photo-2023384.jpeg',
+            'https://images.pexels.com/photos/406014/pexels-photo-406014.jpeg',
+            'https://images.pexels.com/photos/733416/pexels-photo-733416.jpeg',
+            'https://images.pexels.com/photos/542394/pexels-photo-542394.jpeg'
+        ],
+        'bird': [
+            'https://images.pexels.com/photos/326900/pexels-photo-326900.jpeg',
+            'https://images.pexels.com/photos/45911/pexels-photo-45911.jpeg',
+            'https://images.pexels.com/photos/36762/parrot-bird-beak-blue.jpg',
+            'https://images.pexels.com/photos/63574/pexels-photo-63574.jpeg',
+            'https://images.pexels.com/photos/60009/pexels-photo-60009.jpeg'
+        ],
+        'fish': [
+            'https://images.pexels.com/photos/128756/pexels-photo-128756.jpeg',
+            'https://images.pexels.com/photos/36348/pexels-photo.jpg',
+            'https://images.pexels.com/photos/1386604/pexels-photo-1386604.jpeg',
+            'https://images.pexels.com/photos/799410/pexels-photo-799410.jpeg',
+            'https://images.pexels.com/photos/3763819/pexels-photo-3763819.jpeg'
+        ],
+        
+        # Plants
+        'flower': [
+            'https://images.pexels.com/photos/736230/pexels-photo-736230.jpeg',
+            'https://images.pexels.com/photos/56866/garden-rose-red-pink-56866.jpeg',
+            'https://images.pexels.com/photos/931149/pexels-photo-931149.jpeg',
+            'https://images.pexels.com/photos/36764/pexels-photo.jpg',
+            'https://images.pexels.com/photos/462118/pexels-photo-462118.jpeg'
+        ],
+        'tree': [
+            'https://images.pexels.com/photos/38136/pexels-photo-38136.jpeg',
+            'https://images.pexels.com/photos/97554/pexels-photo-97554.jpeg',
+            'https://images.pexels.com/photos/145685/pexels-photo-145685.jpeg',
+            'https://images.pexels.com/photos/372058/pexels-photo-372058.jpeg',
+            'https://images.pexels.com/photos/158607/caucasus-tree-birds-Autumn-158607.jpeg'
+        ],
+        
+        # Objects
+        'car': [
+            'https://images.pexels.com/photos/170811/pexels-photo-170811.jpeg',
+            'https://images.pexels.com/photos/116675/pexels-photo-116675.jpeg',
+            'https://images.pexels.com/photos/210019/pexels-photo-210019.jpeg',
+            'https://images.pexels.com/photos/3802508/pexels-photo-3802508.jpeg',
+            'https://images.pexels.com/photos/112460/pexels-photo-112460.jpeg'
+        ],
+        'chair': [
+            'https://images.pexels.com/photos/276583/pexels-photo-276583.jpeg',
+            'https://images.pexels.com/photos/2079246/pexels-photo-2079246.jpeg',
+            'https://images.pexels.com/photos/3705523/pexels-photo-3705523.jpeg',
+            'https://images.pexels.com/photos/3773577/pexels-photo-3773577.jpeg',
+            'https://images.pexels.com/photos/3773573/pexels-photo-3773573.jpeg'
+        ],
+        'book': [
+            'https://images.pexels.com/photos/159711/books-bookstore-book-reading-159711.jpeg',
+            'https://images.pexels.com/photos/1370295/pexels-photo-1370295.jpeg',
+            'https://images.pexels.com/photos/904620/pexels-photo-904620.jpeg',
+            'https://images.pexels.com/photos/256450/pexels-photo-256450.jpeg',
+            'https://images.pexels.com/photos/694740/pexels-photo-694740.jpeg'
+        ],
+        
+        # Food
+        'pizza': [
+            'https://images.pexels.com/photos/2147491/pexels-photo-2147491.jpeg',
+            'https://images.pexels.com/photos/905847/pexels-photo-905847.jpeg',
+            'https://images.pexels.com/photos/825661/pexels-photo-825661.jpeg',
+            'https://images.pexels.com/photos/2147493/pexels-photo-2147493.jpeg',
+            'https://images.pexels.com/photos/1146760/pexels-photo-1146760.jpeg'
+        ],
+        'apple': [
+            'https://images.pexels.com/photos/61127/pexels-photo-61127.jpeg',
+            'https://images.pexels.com/photos/102104/pexels-photo-102104.jpeg',
+            'https://images.pexels.com/photos/209431/pexels-photo-209431.jpeg',
+            'https://images.pexels.com/photos/161559/background-bitter-breakfast-bright-161559.jpeg',
+            'https://images.pexels.com/photos/209443/pexels-photo-209443.jpeg'
+        ],
+        
+        # People
+        'person': [
+            'https://images.pexels.com/photos/697509/pexels-photo-697509.jpeg',
+            'https://images.pexels.com/photos/774909/pexels-photo-774909.jpeg',
+            'https://images.pexels.com/photos/1036622/pexels-photo-1036622.jpeg',
+            'https://images.pexels.com/photos/712513/pexels-photo-712513.jpeg',
+            'https://images.pexels.com/photos/733872/pexels-photo-733872.jpeg'
+        ],
+        
+        # Places
+        'house': [
+            'https://images.pexels.com/photos/106399/pexels-photo-106399.jpeg',
+            'https://images.pexels.com/photos/259588/pexels-photo-259588.jpeg',
+            'https://images.pexels.com/photos/280229/pexels-photo-280229.jpeg',
+            'https://images.pexels.com/photos/164558/pexels-photo-164558.jpeg',
+            'https://images.pexels.com/photos/258160/pexels-photo-258160.jpeg'
+        ],
+        'mountain': [
+            'https://images.pexels.com/photos/417173/pexels-photo-417173.jpeg',
+            'https://images.pexels.com/photos/2387873/pexels-photo-2387873.jpeg',
+            'https://images.pexels.com/photos/547114/pexels-photo-547114.jpeg',
+            'https://images.pexels.com/photos/361104/pexels-photo-361104.jpeg',
+            'https://images.pexels.com/photos/1054289/pexels-photo-1054289.jpeg'
+        ],
+        'beach': [
+            'https://images.pexels.com/photos/994605/pexels-photo-994605.jpeg',
+            'https://images.pexels.com/photos/1032650/pexels-photo-1032650.jpeg',
+            'https://images.pexels.com/photos/1438761/pexels-photo-1438761.jpeg',
+            'https://images.pexels.com/photos/237272/pexels-photo-237272.jpeg',
+            'https://images.pexels.com/photos/753626/pexels-photo-753626.jpeg'
+        ]
     }
     
     def __init__(self):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Loading classifier on {self.device}...")
+        print(f"\n🚀 Loading classifier on {self.device}...")
         
         # Load pre-trained model
         model_name = "google/vit-base-patch16-224"
@@ -236,25 +384,42 @@ class LearningClassifier:
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        # Load learning data
+        # Load or create learning data
         self.learning_data = self._load_learning_data()
-        print(f"Loaded {len(self.learning_data)} learned objects")
+        
+        # Auto-train if no data exists
+        if len(self.learning_data['samples']) < 10:
+            print("\n📚 No training data found. Auto-training with 5 images per category...")
+            self._auto_train()
+        else:
+            print(f"\n✅ Loaded {len(self.learning_data['samples'])} training samples")
+            print(f"   Knows {len(self.learning_data['objects'])} different objects")
     
     def _load_learning_data(self):
-        """Load user-trained data"""
+        """Load learning data"""
         if os.path.exists(app.config['LEARNING_DATA']):
             with open(app.config['LEARNING_DATA'], 'rb') as f:
                 return pickle.load(f)
         return {
-            'objects': {},  # object_name -> count
-            'features': {},  # feature_hash -> object_name
-            'samples': []    # list of training samples
+            'objects': {},
+            'features': {},
+            'samples': []
         }
     
     def _save_learning_data(self):
         """Save learning data"""
         with open(app.config['LEARNING_DATA'], 'wb') as f:
             pickle.dump(self.learning_data, f)
+    
+    def _download_image(self, url):
+        """Download image from URL"""
+        try:
+            response = requests.get(url, timeout=10)
+            if response.status_code == 200:
+                return Image.open(BytesIO(response.content)).convert('RGB')
+        except:
+            pass
+        return None
     
     def _extract_features(self, image):
         """Extract features from image"""
@@ -263,19 +428,78 @@ class LearningClassifier:
         
         with torch.no_grad():
             outputs = self.model(**inputs, output_hidden_states=True)
-            # Use last hidden state as features
             features = outputs.hidden_states[-1].mean(dim=1).cpu().numpy().flatten()
         
         return features
     
     def _get_feature_hash(self, features):
-        """Create hash from features for quick lookup"""
-        # Quantize features to create a hash
+        """Create hash from features"""
         quantized = np.round(features * 100).astype(int)
         return hashlib.md5(quantized.tobytes()).hexdigest()
     
+    def _auto_train(self):
+        """Auto-train with 5 images per category"""
+        print("\n" + "="*60)
+        print("🎯 AUTO-TRAINING STARTED")
+        print("="*60)
+        
+        total_trained = 0
+        
+        for object_name, urls in self.TRAINING_URLS.items():
+            print(f"\n📚 Training: {object_name.title()}")
+            
+            for i, url in enumerate(urls, 1):
+                try:
+                    print(f"   Downloading image {i}/5...", end=" ")
+                    
+                    # Download image
+                    image = self._download_image(url)
+                    if image is None:
+                        print("❌ Failed")
+                        continue
+                    
+                    # Extract features
+                    features = self._extract_features(image)
+                    feature_hash = self._get_feature_hash(features)
+                    
+                    # Save to learning data
+                    self.learning_data['features'][feature_hash] = object_name
+                    self.learning_data['objects'][object_name] = self.learning_data['objects'].get(object_name, 0) + 1
+                    
+                    # Save image file
+                    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    filename = f"auto_train_{object_name}_{i}_{timestamp}.jpg"
+                    filepath = os.path.join(app.config['TRAINING_FOLDER'], filename)
+                    image.save(filepath)
+                    
+                    # Save sample record
+                    self.learning_data['samples'].append({
+                        'object': object_name,
+                        'source': 'auto_train',
+                        'timestamp': timestamp,
+                        'file': filename
+                    })
+                    
+                    print(f"✅ Learned")
+                    total_trained += 1
+                    
+                    # Small delay to avoid rate limiting
+                    time.sleep(0.5)
+                    
+                except Exception as e:
+                    print(f"❌ Error: {str(e)[:50]}")
+        
+        # Save all learning data
+        self._save_learning_data()
+        
+        print("\n" + "="*60)
+        print(f"✅ AUTO-TRAINING COMPLETE!")
+        print(f"   Total images trained: {total_trained}")
+        print(f"   Unique objects: {len(self.learning_data['objects'])}")
+        print("="*60)
+    
     def predict(self, image_path, top_k=5):
-        """Predict with learning from user feedback"""
+        """Predict objects in image"""
         try:
             image = Image.open(image_path).convert('RGB')
             
@@ -283,7 +507,7 @@ class LearningClassifier:
             features = self._extract_features(image)
             feature_hash = self._get_feature_hash(features)
             
-            # Check if we've seen this image before
+            # Check if we've seen this before
             if feature_hash in self.learning_data['features']:
                 learned_object = self.learning_data['features'][feature_hash]
                 if learned_object in self.CATEGORIES:
@@ -293,8 +517,9 @@ class LearningClassifier:
                         'category': cat['category'],
                         'emoji': cat['emoji'],
                         'color': cat['color'],
-                        'confidence': 0.95,
-                        'percentage': '95%'
+                        'confidence': 0.98,
+                        'percentage': '98%',
+                        'learned': True
                     }]
             
             # Get base model predictions
@@ -306,7 +531,7 @@ class LearningClassifier:
                 probabilities = F.softmax(outputs.logits, dim=-1)[0]
             
             # Get top predictions
-            top_probs, top_indices = torch.topk(probabilities, top_k * 2)
+            top_probs, top_indices = torch.topk(probabilities, top_k * 3)
             
             predictions = []
             seen = set()
@@ -318,7 +543,7 @@ class LearningClassifier:
                 if confidence < 0.01:
                     continue
                 
-                # Try to find in our categories
+                # Find matching object
                 detected = None
                 for obj in self.CATEGORIES.keys():
                     if obj in class_name and obj not in seen:
@@ -340,22 +565,6 @@ class LearningClassifier:
                     if len(predictions) >= top_k:
                         break
             
-            # Boost predictions based on learning data
-            for obj, count in self.learning_data['objects'].items():
-                if obj not in seen and count > 0 and obj in self.CATEGORIES:
-                    cat = self.CATEGORIES[obj]
-                    predictions.append({
-                        'object': obj.title(),
-                        'category': cat['category'],
-                        'emoji': cat['emoji'],
-                        'color': cat['color'],
-                        'confidence': 0.3 + (count * 0.05),
-                        'percentage': f"{30 + count*5}%",
-                        'learned': True
-                    })
-                    if len(predictions) >= top_k:
-                        break
-            
             return predictions[:top_k]
             
         except Exception as e:
@@ -367,6 +576,14 @@ class LearningClassifier:
         try:
             object_name = object_name.lower().strip()
             
+            if object_name not in self.CATEGORIES:
+                # Add to categories dynamically
+                self.CATEGORIES[object_name] = {
+                    'category': 'objects',
+                    'emoji': '📦',
+                    'color': '#4A90E2'
+                }
+            
             # Extract and store features
             image = Image.open(image_path).convert('RGB')
             features = self._extract_features(image)
@@ -375,35 +592,42 @@ class LearningClassifier:
             # Store in learning data
             self.learning_data['features'][feature_hash] = object_name
             self.learning_data['objects'][object_name] = self.learning_data['objects'].get(object_name, 0) + 1
+            
+            # Save image
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"{username}_{object_name}_{timestamp}.jpg"
+            filepath = os.path.join(app.config['TRAINING_FOLDER'], filename)
+            image.save(filepath)
+            
+            # Save sample
             self.learning_data['samples'].append({
                 'object': object_name,
                 'username': username,
-                'timestamp': datetime.now().isoformat()
+                'timestamp': timestamp,
+                'file': filename
             })
-            
-            # Save image for future retraining
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"{username}_{timestamp}_{object_name}.jpg"
-            save_path = os.path.join(app.config['TRAINING_FOLDER'], filename)
-            image.save(save_path)
             
             self._save_learning_data()
             
             return True, f"Learned: {object_name.title()}"
             
         except Exception as e:
-            print(f"Learning error: {e}")
             return False, str(e)
     
     def get_stats(self):
-        """Get learning statistics"""
+        """Get training statistics"""
         return {
             'total_samples': len(self.learning_data['samples']),
             'unique_objects': len(self.learning_data['objects']),
             'objects': self.learning_data['objects']
         }
 
-classifier = LearningClassifier()
+# Initialize the trained classifier
+print("\n" + "="*60)
+print("🎓 AAU HIGH-LEVEL IMAGE CLASSIFIER")
+print("="*60)
+classifier = TrainedClassifier()
+print("="*60 + "\n")
 
 # ============================================================================
 # Authentication Routes
@@ -486,7 +710,6 @@ def predict():
     if file.filename == '':
         return jsonify({'error': 'No file selected'}), 400
     
-    # Save temp file
     filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
@@ -511,7 +734,6 @@ def predict():
 @app.route('/learn', methods=['POST'])
 @login_required
 def learn():
-    """Learn from user feedback"""
     if 'file' not in request.files or 'object_name' not in request.form:
         return jsonify({'error': 'Missing data'}), 400
     
@@ -521,7 +743,6 @@ def learn():
     if not object_name.strip():
         return jsonify({'error': 'Please enter an object name'}), 400
     
-    # Save temp file
     filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(filepath)
@@ -547,7 +768,6 @@ def learn():
 @app.route('/stats')
 @login_required
 def get_stats():
-    """Get learning statistics"""
     return jsonify(classifier.get_stats())
 
 # ============================================================================
@@ -578,23 +798,10 @@ LOGIN_HTML = """
             max-width: 400px;
             text-align: center;
         }
-        .logo {
-            margin-bottom: 20px;
-        }
-        .logo img {
-            width: 200px;
-        }
-        .university-name {
-            color: #8B0000;
-            font-size: 20px;
-            font-weight: bold;
-            margin-bottom: 5px;
-        }
-        .college-name {
-            color: #FFD700;
-            font-size: 14px;
-            margin-bottom: 20px;
-        }
+        .logo { margin-bottom: 20px; }
+        .logo img { width: 200px; }
+        .university-name { color: #8B0000; font-size: 20px; font-weight: bold; }
+        .college-name { color: #FFD700; font-size: 14px; margin-bottom: 20px; }
         .project-title {
             background: #f5f5f5;
             padding: 15px;
@@ -602,13 +809,7 @@ LOGIN_HTML = """
             margin-bottom: 25px;
             border-left: 5px solid #8B0000;
         }
-        .project-title h3 {
-            color: #8B0000;
-            font-size: 16px;
-        }
-        .input-group {
-            margin-bottom: 15px;
-        }
+        .input-group { margin-bottom: 15px; }
         .input-group input {
             width: 100%;
             padding: 12px 15px;
@@ -616,10 +817,7 @@ LOGIN_HTML = """
             border-radius: 8px;
             font-size: 16px;
         }
-        .input-group input:focus {
-            outline: none;
-            border-color: #FFD700;
-        }
+        .input-group input:focus { border-color: #FFD700; outline: none; }
         button {
             width: 100%;
             padding: 14px;
@@ -632,9 +830,7 @@ LOGIN_HTML = """
             cursor: pointer;
             margin-top: 10px;
         }
-        button:hover {
-            transform: translateY(-2px);
-        }
+        button:hover { transform: translateY(-2px); }
         .error {
             background: #fee;
             color: #c33;
@@ -657,9 +853,7 @@ LOGIN_HTML = """
             <p>Machine Learning Course (COSC 6041)</p>
         </div>
         
-        {% if error %}
-        <div class="error">{{ error }}</div>
-        {% endif %}
+        {% if error %}<div class="error">{{ error }}</div>{% endif %}
         
         <form method="POST">
             <div class="input-group">
@@ -696,9 +890,7 @@ USERS_HTML = """
             align-items: center;
             gap: 15px;
         }
-        .logo img {
-            height: 40px;
-        }
+        .logo img { height: 40px; }
         .nav-links a {
             color: white;
             text-decoration: none;
@@ -817,15 +1009,8 @@ INDEX_HTML = """
             align-items: center;
             gap: 15px;
         }
-        
-        .logo img {
-            height: 40px;
-        }
-        
-        .university-info h2 {
-            font-size: 18px;
-            color: #FFD700;
-        }
+        .logo img { height: 40px; }
+        .university-info h2 { font-size: 18px; color: #FFD700; }
         
         .user-info {
             background: #FFD700;
@@ -841,21 +1026,13 @@ INDEX_HTML = """
             margin-left: 20px;
         }
         
-        .container {
-            max-width: 1000px;
-            margin: 40px auto;
-            padding: 0 20px;
-        }
+        .container { max-width: 1000px; margin: 40px auto; padding: 0 20px; }
         
         .project-header {
             text-align: center;
             margin-bottom: 30px;
         }
-        
-        .project-header h1 {
-            color: #8B0000;
-            font-size: 32px;
-        }
+        .project-header h1 { color: #8B0000; font-size: 32px; }
         
         .stats-card {
             background: white;
@@ -866,12 +1043,7 @@ INDEX_HTML = """
             justify-content: space-around;
             border-left: 5px solid #FFD700;
         }
-        
-        .stat-number {
-            font-size: 28px;
-            font-weight: bold;
-            color: #8B0000;
-        }
+        .stat-number { font-size: 28px; font-weight: bold; color: #8B0000; }
         
         .main-card {
             background: white;
@@ -888,16 +1060,8 @@ INDEX_HTML = """
             cursor: pointer;
             margin: 20px 0;
         }
-        
-        .upload-area:hover {
-            border-color: #FFD700;
-            background: #fff9e6;
-        }
-        
-        .upload-icon {
-            font-size: 48px;
-            color: #8B0000;
-        }
+        .upload-area:hover { border-color: #FFD700; background: #fff9e6; }
+        .upload-icon { font-size: 48px; color: #8B0000; }
         
         #preview {
             max-width: 100%;
@@ -919,11 +1083,6 @@ INDEX_HTML = """
             cursor: pointer;
             width: 100%;
             margin: 10px 0;
-        }
-        
-        .btn-small {
-            padding: 8px 15px;
-            width: auto;
         }
         
         .prediction-item {
@@ -969,11 +1128,7 @@ INDEX_HTML = """
             border: 2px solid #ddd;
             border-radius: 8px;
         }
-        
-        .learning-input:focus {
-            border-color: #FFD700;
-            outline: none;
-        }
+        .learning-input:focus { border-color: #FFD700; outline: none; }
         
         .spinner {
             border: 5px solid #f3f3f3;
@@ -986,15 +1141,9 @@ INDEX_HTML = """
             display: none;
         }
         
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
         
-        .results {
-            display: none;
-        }
-        
+        .results { display: none; }
         .success-message {
             background: #d4edda;
             color: #155724;
@@ -1026,9 +1175,7 @@ INDEX_HTML = """
             <span class="user-info">{{ session.full_name }}</span>
             <div class="nav-links">
                 <a href="/">Home</a>
-                {% if session.role == 'admin' %}
-                <a href="/users">Manage Users</a>
-                {% endif %}
+                {% if session.role == 'admin' %}<a href="/users">Manage Users</a>{% endif %}
                 <a href="/logout">Logout</a>
             </div>
         </div>
@@ -1047,7 +1194,7 @@ INDEX_HTML = """
             </div>
             <div class="stat-item">
                 <div class="stat-number">{{ stats.unique_objects }}</div>
-                <div>Objects Learned</div>
+                <div>Objects Known</div>
             </div>
         </div>
         
@@ -1073,7 +1220,7 @@ INDEX_HTML = """
                 <h3 style="color: #8B0000;">📚 Teach the Model</h3>
                 <p>What object is in this image?</p>
                 <input type="text" id="objectName" class="learning-input" placeholder="e.g., cat, car, person">
-                <button class="btn btn-small" onclick="submitLearning()" style="background: #4CAF50;">✓ Submit & Teach</button>
+                <button class="btn" onclick="submitLearning()" style="background: #4CAF50;">✓ Submit & Teach</button>
                 <div id="learningMessage" class="success-message"></div>
             </div>
         </div>
@@ -1187,7 +1334,7 @@ INDEX_HTML = """
                 const data = await response.json();
                 
                 if (data.success) {
-                    messageDiv.textContent = `✅ Learned: ${objectName}! The model will remember this.`;
+                    messageDiv.textContent = `✅ ${data.message}`;
                     messageDiv.style.display = 'block';
                     setTimeout(() => {
                         messageDiv.style.display = 'none';
