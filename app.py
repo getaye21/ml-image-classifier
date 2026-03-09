@@ -13,7 +13,7 @@ Course: COSC 6041 - Machine Learning
 Supervisor: Dr. Yaregal A.
 Submission Date: March 2026
 
-FOCUS: Image Classification Only - High Accuracy Mode
+FOCUS: REAL Image Classification - Animals, Plants, Objects
 ====================================================================
 """
 
@@ -23,17 +23,22 @@ import numpy as np
 from transformers import AutoFeatureExtractor, AutoModel
 import xgboost as xgb
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 from PIL import Image
 import os
 import uuid
 import joblib
-import bcrypt
+import hashlib
 import secrets
 from datetime import datetime, timedelta
 from functools import wraps
 import re
 import json
+import glob
 from werkzeug.utils import secure_filename
+import requests
+from io import BytesIO
 
 # ============================================================================
 # Application Configuration
@@ -53,28 +58,23 @@ app.config['LOCKOUT_TIME'] = timedelta(minutes=15)
 # Create directories
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs('users', exist_ok=True)
+os.makedirs('training_data', exist_ok=True)
 
 # ============================================================================
 # Secure User Authentication System
 # ============================================================================
 
 class SecureUserManager:
-    """Manages user authentication with security best practices"""
-    
     def __init__(self):
         self.users_file = 'users/users.json'
         self.login_attempts = {}
         
     def hash_password(self, password):
-        salt = bcrypt.gensalt(rounds=12)
-        return bcrypt.hashpw(password.encode('utf-8'), salt).decode('utf-8')
+        salt = "AAU_SALT"
+        return hashlib.sha256((password + salt).encode()).hexdigest()
     
     def verify_password(self, password, hashed):
-        return bcrypt.checkpw(password.encode('utf-8'), hashed.encode('utf-8'))
-    
-    def validate_email(self, email):
-        pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
-        return re.match(pattern, email) is not None
+        return self.hash_password(password) == hashed
     
     def check_login_attempts(self, username, ip_address):
         key = f"{username}_{ip_address}"
@@ -100,17 +100,16 @@ class SecureUserManager:
         if not allowed:
             return False, msg
         
-        # Default users for demo
         default_users = {
             'getaye': {
-                'password': 'Getaye@6132',
+                'password_hash': self.hash_password('Getaye@6132'),
                 'full_name': 'Getaye Fiseha',
                 'role': 'student',
                 'student_id': 'GSE/6132/18',
                 'email': 'getaye.fiseha@aau.edu.et'
             },
             'guest': {
-                'password': 'Guest@2026',
+                'password_hash': self.hash_password('Guest@2026'),
                 'full_name': 'Guest User',
                 'role': 'guest',
                 'student_id': 'GUEST/001',
@@ -119,7 +118,7 @@ class SecureUserManager:
         }
         
         if username in default_users:
-            if password == default_users[username]['password']:
+            if self.verify_password(password, default_users[username]['password_hash']):
                 return True, default_users[username]
         
         self.record_failed_attempt(username, ip_address)
@@ -141,64 +140,43 @@ def login_required(f):
     return decorated_function
 
 # ============================================================================
-# HIGH-PRECISION CLASSIFIER - Optimized for Accuracy
+# REAL IMAGE CLASSIFIER - Actually Learns from Images
 # ============================================================================
 
-class HighPrecisionClassifier:
+class RealImageClassifier:
     """
-    Optimized classifier for HIGH ACCURACY image classification
-    Uses: Hugging Face ViT + XGBoost with optimized parameters
+    REAL image classifier that actually learns from training data
+    Supports: Animals, Plants, Objects, People, Vehicles, etc.
     """
     
     def __init__(self, model_name="google/vit-base-patch16-224"):
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         print(f"Initializing on device: {self.device}")
         
-        # Hugging Face CNN for feature extraction
+        # Load Hugging Face ViT
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
         self.cnn = AutoModel.from_pretrained(model_name).to(self.device)
         self.cnn.eval()
         
-        # OPTIMIZED XGBoost for HIGH ACCURACY
-        self.boosting = xgb.XGBClassifier(
-            n_estimators=500,              # More trees = better learning
-            max_depth=12,                   # Deeper trees = capture complex patterns
-            learning_rate=0.05,              # Lower learning rate = more precise
-            subsample=0.9,                   # Use 90% of data per tree
-            colsample_bytree=0.9,            # Use 90% of features
-            min_child_weight=3,              # Prevent overfitting
-            gamma=0.1,                        # Minimum loss reduction
-            reg_alpha=0.1,                    # L1 regularization
-            reg_lambda=1.0,                    # L2 regularization
-            objective='multi:softprob',
-            eval_metric=['mlogloss', 'merror'],
-            use_label_encoder=False,
-            random_state=42,
-            n_jobs=-1
-        )
-        
+        # Initialize XGBoost (will be trained later)
+        self.boosting = None
         self.label_encoder = LabelEncoder()
-        self.classes = ['Cat', 'Dog', 'Bird', 'Car', 'Person', 'Book', 'Phone', 'Chair', 'Table', 'Tree']
-        self.is_trained = True  # Set to True since we have pre-trained model
+        self.classes = []
+        self.is_trained = False
         
-        # Train on sample data if no model exists
-        self._initialize_sample_model()
+        # Try to load existing model
+        self.load_model()
     
-    def _initialize_sample_model(self):
-        """Initialize with sample training data for demo"""
-        if os.path.exists('high_precision_model.pkl'):
-            self.load('high_precision_model.pkl')
-            print("Loaded pre-trained model")
-        else:
-            print("Using default pre-trained configuration")
-            # Create synthetic labels for demo
-            self.label_encoder.fit(self.classes)
-    
-    def extract_features(self, image_path):
-        """Extract deep features using ViT"""
+    def extract_features(self, image):
+        """Extract deep features from image"""
         try:
-            image = Image.open(image_path).convert('RGB')
-            inputs = self.feature_extractor(images=image, return_tensors="pt")
+            # Handle both file paths and PIL Images
+            if isinstance(image, str):
+                img = Image.open(image).convert('RGB')
+            else:
+                img = image.convert('RGB')
+            
+            inputs = self.feature_extractor(images=img, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
             with torch.no_grad():
@@ -210,68 +188,133 @@ class HighPrecisionClassifier:
             print(f"Feature extraction error: {e}")
             return None
     
+    def train(self, image_paths, labels):
+        """
+        Train the classifier on real images
+        """
+        print(f"\n📚 Training on {len(image_paths)} images...")
+        
+        # Extract features from all images
+        features = []
+        valid_labels = []
+        
+        for img_path, label in zip(image_paths, labels):
+            if os.path.exists(img_path):
+                feat = self.extract_features(img_path)
+                if feat is not None:
+                    features.append(feat)
+                    valid_labels.append(label)
+                    print(f"   ✓ Processed: {os.path.basename(img_path)} -> {label}")
+        
+        if len(features) == 0:
+            raise ValueError("No valid features extracted!")
+        
+        X = np.array(features)
+        y = self.label_encoder.fit_transform(valid_labels)
+        self.classes = self.label_encoder.classes_
+        
+        print(f"\n📊 Training Data:")
+        print(f"   Features shape: {X.shape}")
+        print(f"   Classes: {list(self.classes)}")
+        
+        # Split into train/validation
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y
+        )
+        
+        # Initialize and train XGBoost
+        self.boosting = xgb.XGBClassifier(
+            n_estimators=300,
+            max_depth=8,
+            learning_rate=0.1,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective='multi:softprob',
+            eval_metric='mlogloss',
+            use_label_encoder=False,
+            random_state=42,
+            n_jobs=-1
+        )
+        
+        print("\n🚀 Training XGBoost...")
+        self.boosting.fit(
+            X_train, y_train,
+            eval_set=[(X_val, y_val)],
+            early_stopping_rounds=20,
+            verbose=False
+        )
+        
+        # Evaluate
+        train_pred = self.boosting.predict(X_train)
+        val_pred = self.boosting.predict(X_val)
+        
+        train_acc = accuracy_score(y_train, train_pred)
+        val_acc = accuracy_score(y_val, val_pred)
+        
+        self.is_trained = True
+        
+        print(f"\n✅ Training Complete!")
+        print(f"   Training Accuracy: {train_acc:.2%}")
+        print(f"   Validation Accuracy: {val_acc:.2%}")
+        
+        # Save the model
+        self.save_model()
+        
+        return {
+            'train_accuracy': float(train_acc),
+            'val_accuracy': float(val_acc),
+            'classes': list(self.classes),
+            'num_classes': len(self.classes),
+            'num_samples': len(features)
+        }
+    
     def predict(self, image_path, top_k=3):
-        """Predict with high confidence scores"""
+        """Predict class for a new image"""
+        if not self.is_trained or self.boosting is None:
+            return self._get_training_needed_message()
+        
         features = self.extract_features(image_path)
         if features is None:
-            return self._get_fallback_predictions()
+            return [{'class': 'Error extracting features', 'confidence': 0, 'probability': '0%'}]
         
-        try:
-            features = features.reshape(1, -1)
-            
-            # For demo, return confidence scores based on feature patterns
-            # In production, this would use the trained XGBoost model
-            if hasattr(self.boosting, 'get_booster') and self.boosting.get_booster() is not None:
-                probabilities = self.boosting.predict_proba(features)[0]
-            else:
-                # Demo mode - generate realistic probabilities
-                probabilities = self._generate_demo_probabilities(features)
-            
-            top_indices = np.argsort(probabilities)[-top_k:][::-1]
-            
-            predictions = []
-            for idx in top_indices:
-                predictions.append({
-                    'class': self.classes[idx % len(self.classes)],
-                    'confidence': float(probabilities[idx]),
-                    'probability': f"{probabilities[idx]:.2%}"
-                })
-            
-            return predictions
-            
-        except Exception as e:
-            print(f"Prediction error: {e}")
-            return self._get_fallback_predictions()
+        features = features.reshape(1, -1)
+        
+        # Get probabilities
+        probabilities = self.boosting.predict_proba(features)[0]
+        
+        # Get top-k predictions
+        top_indices = np.argsort(probabilities)[-top_k:][::-1]
+        
+        predictions = []
+        for idx in top_indices:
+            predictions.append({
+                'class': self.classes[idx],
+                'confidence': float(probabilities[idx]),
+                'probability': f"{probabilities[idx]:.2%}"
+            })
+        
+        return predictions
     
-    def _generate_demo_probabilities(self, features):
-        """Generate realistic probabilities based on feature patterns"""
-        # Use feature values to simulate class probabilities
-        feature_sum = np.sum(features)
-        base_probs = np.abs(features[0, :len(self.classes)]) if features.shape[1] >= len(self.classes) else np.random.rand(len(self.classes))
-        probs = base_probs / np.sum(base_probs)
-        # Add confidence (make top prediction ~85-95%)
-        probs[0] = max(0.85, probs[0])
-        probs[1:] = probs[1:] * (1 - probs[0]) / np.sum(probs[1:])
-        return probs
+    def _get_training_needed_message(self):
+        """Return message when model needs training"""
+        return [{
+            'class': '⚠️ Model Not Trained',
+            'confidence': 0,
+            'probability': 'Please upload training images first!'
+        }]
     
-    def _get_fallback_predictions(self):
-        """Return fallback predictions if model fails"""
-        return [
-            {'class': 'Cat', 'confidence': 0.92, 'probability': '92%'},
-            {'class': 'Dog', 'confidence': 0.05, 'probability': '5%'},
-            {'class': 'Bird', 'confidence': 0.03, 'probability': '3%'}
-        ]
-    
-    def save(self, path='high_precision_model.pkl'):
+    def save_model(self, path='real_classifier_model.pkl'):
         """Save trained model"""
-        joblib.dump({
-            'boosting': self.boosting,
-            'encoder': self.label_encoder,
-            'classes': self.classes,
-            'is_trained': self.is_trained
-        }, path)
+        if self.boosting is not None:
+            joblib.dump({
+                'boosting': self.boosting,
+                'encoder': self.label_encoder,
+                'classes': self.classes,
+                'is_trained': self.is_trained
+            }, path)
+            print(f"💾 Model saved to {path}")
     
-    def load(self, path='high_precision_model.pkl'):
+    def load_model(self, path='real_classifier_model.pkl'):
         """Load trained model"""
         if os.path.exists(path):
             data = joblib.load(path)
@@ -279,11 +322,12 @@ class HighPrecisionClassifier:
             self.label_encoder = data['encoder']
             self.classes = data['classes']
             self.is_trained = data['is_trained']
+            print(f"📂 Loaded model with {len(self.classes)} classes")
             return True
         return False
 
-# Initialize the high-precision classifier
-model = HighPrecisionClassifier()
+# Initialize the REAL classifier
+classifier = RealImageClassifier()
 
 # ============================================================================
 # Routes - Authentication
@@ -291,9 +335,7 @@ model = HighPrecisionClassifier()
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    """User login page"""
     error = None
-    
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
@@ -307,7 +349,6 @@ def login():
             session['role'] = result['role']
             session['student_id'] = result['student_id']
             session.permanent = True
-            
             flash(f'Welcome, {result["full_name"]}!', 'success')
             return redirect(url_for('index'))
         else:
@@ -322,17 +363,53 @@ def logout():
     return redirect(url_for('index'))
 
 # ============================================================================
-# Main Route - Classification Only UI
+# Main Routes
 # ============================================================================
 
 @app.route('/')
 def index():
-    """Home page - Classification Only"""
-    return render_template_string(INDEX_HTML, session=session)
+    """Home page - Classification Interface"""
+    return render_template_string(INDEX_HTML, session=session, 
+                                 is_trained=classifier.is_trained,
+                                 classes=classifier.classes)
+
+@app.route('/train', methods=['GET', 'POST'])
+@login_required
+def train():
+    """Training interface - Upload labeled images"""
+    if request.method == 'POST':
+        files = request.files.getlist('images')
+        labels = request.form.getlist('labels')
+        
+        if len(files) != len(labels):
+            return jsonify({'error': 'Number of images and labels must match'}), 400
+        
+        # Save uploaded files
+        image_paths = []
+        for file in files:
+            if file and file.filename:
+                filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
+                filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+                file.save(filepath)
+                image_paths.append(filepath)
+        
+        try:
+            # Train the classifier
+            metrics = classifier.train(image_paths, labels)
+            return jsonify({'success': True, 'metrics': metrics})
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+        finally:
+            # Cleanup
+            for path in image_paths:
+                if os.path.exists(path):
+                    os.remove(path)
+    
+    return render_template_string(TRAIN_HTML, session=session)
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """Prediction endpoint - Returns high-accuracy classifications"""
+    """Predict endpoint"""
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
     
@@ -346,19 +423,14 @@ def predict():
     file.save(filepath)
     
     try:
-        # Get high-accuracy predictions
-        predictions = model.predict(filepath)
-        
-        # Add confidence score
-        top_confidence = predictions[0]['confidence']
+        # Get predictions
+        predictions = classifier.predict(filepath)
         
         return jsonify({
             'success': True,
             'predictions': predictions,
             'filename': file.filename,
-            'top_confidence': f"{top_confidence:.2%}",
-            'model_type': 'High-Precision ViT + XGBoost',
-            'accuracy_target': '95%+'
+            'is_trained': classifier.is_trained
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -366,30 +438,74 @@ def predict():
         if os.path.exists(filepath):
             os.remove(filepath)
 
-@app.route('/model-info')
-def model_info():
-    """Get model information"""
+@app.route('/model-status')
+def model_status():
+    """Get model status"""
     return jsonify({
-        'classes': model.classes,
-        'num_classes': len(model.classes),
-        'model_type': 'ViT + XGBoost (Optimized)',
-        'parameters': {
-            'n_estimators': 500,
-            'max_depth': 12,
-            'learning_rate': 0.05,
-            'target_accuracy': '95%+'
-        }
+        'is_trained': classifier.is_trained,
+        'classes': list(classifier.classes) if classifier.is_trained else [],
+        'num_classes': len(classifier.classes) if classifier.is_trained else 0
     })
 
+@app.route('/profile')
+@login_required
+def profile():
+    return render_template_string(PROFILE_HTML, session=session)
+
+@app.route('/sample-dataset')
+@login_required
+def sample_dataset():
+    """Download and prepare a sample dataset for testing"""
+    try:
+        # Create sample directories
+        sample_dir = 'sample_training'
+        os.makedirs(sample_dir, exist_ok=True)
+        
+        # Sample image URLs (you can add more)
+        samples = {
+            'cat': ['https://images.pexels.com/photos/45201/kitty-cat-kitten-pet-45201.jpeg'],
+            'dog': ['https://images.pexels.com/photos/1805164/pexels-photo-1805164.jpeg'],
+            'bird': ['https://images.pexels.com/photos/326900/pexels-photo-326900.jpeg'],
+            'elephant': ['https://images.pexels.com/photos/66898/elephant-calf-african-elephant-africa-66898.jpeg'],
+            'flower': ['https://images.pexels.com/photos/736230/pexels-photo-736230.jpeg']
+        }
+        
+        image_paths = []
+        labels = []
+        
+        for class_name, urls in samples.items():
+            class_dir = os.path.join(sample_dir, class_name)
+            os.makedirs(class_dir, exist_ok=True)
+            
+            for i, url in enumerate(urls):
+                try:
+                    response = requests.get(url)
+                    img_path = os.path.join(class_dir, f"{i}.jpg")
+                    with open(img_path, 'wb') as f:
+                        f.write(response.content)
+                    image_paths.append(img_path)
+                    labels.append(class_name)
+                except:
+                    pass
+        
+        if image_paths:
+            metrics = classifier.train(image_paths, labels)
+            return jsonify({'success': True, 'metrics': metrics})
+        else:
+            return jsonify({'error': 'Could not download samples'}), 500
+            
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 # ============================================================================
-# HTML Template - Clean Classification UI Only
+# HTML Templates
 # ============================================================================
 
 INDEX_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AAU - High-Precision Classifier | Getaye Fiseha GSE/6132/18</title>
+    <title>AAU - Real Image Classifier | Getaye Fiseha GSE/6132/18</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body { 
@@ -398,7 +514,6 @@ INDEX_HTML = """
             min-height: 100vh;
         }
         
-        /* AAU Header */
         .aau-header { 
             background: linear-gradient(135deg, #006B3F 0%, #FCD116 100%); 
             padding: 20px; 
@@ -409,7 +524,6 @@ INDEX_HTML = """
         .aau-header h1 { font-size: 32px; margin-bottom: 5px; }
         .aau-header h2 { font-size: 18px; font-weight: normal; opacity: 0.9; }
         
-        /* Navigation */
         .navbar { 
             background: #006B3F; 
             padding: 15px 30px; 
@@ -429,7 +543,6 @@ INDEX_HTML = """
         .nav-links a:hover { 
             background: #FCD116; 
             color: #006B3F; 
-            transform: translateY(-2px);
         }
         .student-badge { 
             background: #FCD116; 
@@ -437,232 +550,116 @@ INDEX_HTML = """
             padding: 5px 15px; 
             border-radius: 20px; 
             font-weight: bold;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
         }
         
-        /* Main Container */
-        .container { 
-            max-width: 1000px; 
-            margin: 40px auto; 
-            padding: 0 20px; 
+        .container { max-width: 1200px; margin: 40px auto; padding: 0 20px; }
+        
+        .model-status {
+            background: white;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            border-left: 5px solid #006B3F;
         }
         
-        /* Hero Section */
-        .hero { 
-            text-align: center; 
-            margin-bottom: 40px; 
-        }
-        .hero h1 { 
-            color: #006B3F; 
-            font-size: 36px; 
-            text-shadow: 2px 2px 4px rgba(0,0,0,0.1);
-        }
-        .hero p { 
-            color: #666; 
-            font-size: 18px; 
-        }
-        
-        /* Accuracy Badge */
-        .accuracy-badge {
-            background: linear-gradient(135deg, #006B3F, #FCD116);
-            color: white;
-            padding: 15px 30px;
-            border-radius: 50px;
-            display: inline-block;
-            font-size: 24px;
+        .status-trained {
+            color: #006B3F;
             font-weight: bold;
-            margin: 20px 0;
-            box-shadow: 0 10px 20px rgba(0,107,63,0.3);
-            animation: pulse 2s infinite;
-        }
-        @keyframes pulse {
-            0% { transform: scale(1); }
-            50% { transform: scale(1.05); }
-            100% { transform: scale(1); }
         }
         
-        /* Project Info Card */
-        .project-card { 
-            background: white; 
-            border-radius: 20px; 
-            padding: 25px; 
-            margin-bottom: 30px; 
-            box-shadow: 0 10px 30px rgba(0,0,0,0.15); 
-            border-left: 8px solid #FCD116; 
-        }
-        .info-grid { 
-            display: grid; 
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); 
-            gap: 15px; 
-        }
-        .info-item { 
-            padding: 15px; 
-            background: #f8f9fa; 
-            border-radius: 10px; 
-            border-left: 4px solid #006B3F;
-        }
-        .info-item strong { 
-            color: #006B3F; 
-            display: block; 
-            margin-bottom: 5px; 
+        .status-untrained {
+            color: #FCD116;
+            font-weight: bold;
         }
         
-        /* Classification Card */
-        .classify-card { 
-            background: white; 
-            border-radius: 20px; 
-            padding: 40px; 
-            box-shadow: 0 20px 40px rgba(0,0,0,0.2); 
-            text-align: center;
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
         }
         
-        /* Upload Area */
+        .card {
+            background: white;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+        }
+        
         .upload-area { 
             border: 3px dashed #006B3F; 
             border-radius: 20px; 
-            padding: 60px 40px; 
+            padding: 40px; 
             text-align: center; 
             cursor: pointer; 
             transition: all 0.3s; 
-            margin-bottom: 30px;
-            background: linear-gradient(135deg, #fff, #f8f9fa);
+            margin: 20px 0;
         }
         .upload-area:hover { 
             border-color: #FCD116; 
             background: #fff9e6;
-            transform: translateY(-5px);
-            box-shadow: 0 15px 30px rgba(252,209,22,0.2);
-        }
-        .upload-area i { 
-            font-size: 64px; 
-            color: #006B3F; 
-            margin-bottom: 15px; 
-            display: block; 
-        }
-        .upload-area p { 
-            font-size: 20px; 
-            color: #333; 
-            margin-bottom: 10px; 
-        }
-        .upload-area .hint { 
-            color: #999; 
-            font-size: 14px; 
         }
         
-        /* Preview */
-        .preview-container {
-            margin: 30px 0;
-            position: relative;
-            display: inline-block;
-        }
-        #preview { 
-            max-width: 100%; 
-            max-height: 300px; 
-            display: none; 
-            margin: 0 auto; 
-            border-radius: 15px; 
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3); 
-            border: 4px solid #FCD116;
-        }
-        
-        /* Button */
         .btn { 
             background: linear-gradient(135deg, #006B3F, #FCD116); 
             color: white; 
             border: none; 
-            padding: 18px 40px; 
-            border-radius: 50px; 
-            font-size: 20px; 
+            padding: 15px 30px; 
+            border-radius: 10px; 
+            font-size: 16px; 
             font-weight: 600; 
             cursor: pointer; 
             transition: all 0.3s; 
             width: 100%;
+            margin: 10px 0;
+        }
+        .btn:hover { 
+            transform: translateY(-2px); 
             box-shadow: 0 10px 20px rgba(0,107,63,0.3);
         }
-        .btn:hover:not(:disabled) { 
-            transform: translateY(-3px); 
-            box-shadow: 0 15px 30px rgba(0,107,63,0.4);
-        }
-        .btn:disabled { 
-            opacity: 0.7; 
-            cursor: not-allowed; 
+        
+        .btn-secondary {
+            background: #f0f0f0;
+            color: #333;
         }
         
-        /* Results */
-        .results { 
-            margin-top: 40px; 
-            padding: 30px; 
-            background: white; 
-            border-radius: 20px; 
-            box-shadow: 0 10px 30px rgba(0,0,0,0.15); 
+        #preview { 
+            max-width: 100%; 
+            max-height: 300px; 
             display: none; 
+            margin: 20px auto; 
+            border-radius: 10px; 
+            border: 4px solid #FCD116;
         }
-        .results h3 { 
-            color: #006B3F; 
-            margin-bottom: 20px; 
-            font-size: 24px; 
-        }
+        
         .prediction-item { 
             display: flex; 
             justify-content: space-between; 
-            align-items: center; 
-            padding: 15px 20px; 
+            padding: 15px; 
             background: #f8f9fa; 
-            margin-bottom: 10px; 
+            margin: 10px 0; 
             border-radius: 10px; 
-            transition: all 0.3s;
-        }
-        .prediction-item:hover {
-            transform: translateX(10px);
-            box-shadow: 0 5px 15px rgba(0,0,0,0.1);
         }
         .top-prediction { 
             border-left: 8px solid #FCD116; 
             background: #fff9e6; 
-            font-weight: bold;
-        }
-        .prediction-class { 
-            font-size: 18px; 
-            color: #333; 
-        }
-        .prediction-prob { 
-            background: #006B3F; 
-            color: white; 
-            padding: 8px 20px; 
-            border-radius: 30px; 
-            font-size: 16px; 
-            font-weight: bold; 
         }
         
-        /* Spinner */
-        .spinner { 
-            border: 5px solid #f3f3f3; 
-            border-top: 5px solid #FCD116; 
-            border-radius: 50%; 
-            width: 60px; 
-            height: 60px; 
-            animation: spin 1s linear infinite; 
-            margin: 30px auto; 
-            display: none; 
-        }
-        @keyframes spin { 
-            0% { transform: rotate(0deg); } 
-            100% { transform: rotate(360deg); } 
+        .classes-list {
+            margin-top: 20px;
+            padding: 15px;
+            background: #f0f0f0;
+            border-radius: 10px;
         }
         
-        /* Footer */
-        .footer { 
-            background: #006B3F; 
-            color: #FCD116; 
-            padding: 30px; 
-            margin-top: 60px; 
+        .class-tag {
+            display: inline-block;
+            padding: 5px 15px;
+            background: #006B3F;
+            color: white;
+            border-radius: 20px;
+            margin: 5px;
+            font-size: 14px;
         }
-        .footer-content { 
-            max-width: 1000px; 
-            margin: 0 auto; 
-            text-align: center; 
-        }
-        .footer p { margin: 10px 0; }
     </style>
 </head>
 <body>
@@ -672,12 +669,13 @@ INDEX_HTML = """
     </div>
     
     <div class="navbar">
-        <div style="display: flex; align-items: center;">
+        <div>
             <span class="student-badge">GSE/6132/18 | Getaye Fiseha</span>
         </div>
         <div class="nav-links">
             <a href="/">Home</a>
             {% if session.username %}
+                <a href="/train">Train Model</a>
                 <a href="/profile">{{ session.full_name }}</a>
                 <a href="/logout">Logout</a>
             {% else %}
@@ -687,135 +685,109 @@ INDEX_HTML = """
     </div>
     
     <div class="container">
-        <div class="hero">
-            <h1>🤖 High-Precision Image Classifier</h1>
-            <p>MSc Project | COSC 6041 - Machine Learning | Network & Security Stream</p>
-            <div class="accuracy-badge">
-                ⚡ 95%+ Target Accuracy
-            </div>
+        <div class="model-status">
+            <h3>🤖 Model Status: 
+                {% if is_trained %}
+                <span class="status-trained">✓ TRAINED ({{ classes|length }} classes)</span>
+                {% else %}
+                <span class="status-untrained">⚠ NOT TRAINED - Please train first</span>
+                {% endif %}
+            </h3>
         </div>
         
-        <div class="project-card">
-            <div class="info-grid">
-                <div class="info-item">
-                    <strong>Student</strong>
-                    Getaye Fiseha
+        <div class="grid-2">
+            <!-- Classification Card -->
+            <div class="card">
+                <h2 style="color: #006B3F;">🔍 Classify Image</h2>
+                <p>Upload any image to classify (animals, plants, objects, etc.)</p>
+                
+                <div class="upload-area" onclick="document.getElementById('fileInput').click()">
+                    <input type="file" id="fileInput" accept="image/*" style="display: none;">
+                    <p style="font-size: 24px;">📸</p>
+                    <p>Click to select image</p>
                 </div>
-                <div class="info-item">
-                    <strong>Student ID</strong>
-                    GSE/6132/18
-                </div>
-                <div class="info-item">
-                    <strong>Supervisor</strong>
-                    Dr. Yaregal A.
-                </div>
-                <div class="info-item">
-                    <strong>Model</strong>
-                    ViT + XGBoost (Optimized)
-                </div>
-            </div>
-        </div>
-        
-        <div class="classify-card">
-            <h2 style="color: #006B3F; margin-bottom: 30px;">📸 Upload Image for Classification</h2>
-            
-            <div class="upload-area" onclick="document.getElementById('fileInput').click()">
-                <input type="file" id="fileInput" accept="image/*" style="display: none;">
-                <i>📤</i>
-                <p>Click or drag image here</p>
-                <p class="hint">Supported: JPG, PNG, JPEG (Max 16MB)</p>
-            </div>
-            
-            <div class="preview-container">
+                
                 <img id="preview" src="#" alt="Preview">
+                
+                <button class="btn" onclick="classifyImage()">🔍 Classify Image</button>
+                
+                <div id="results" style="margin-top: 20px;"></div>
             </div>
             
-            <div class="spinner" id="spinner"></div>
-            
-            <button class="btn" id="classifyBtn" onclick="classifyImage()">🔍 Classify Image with High Precision</button>
-            
-            <div class="results" id="results">
-                <h3>🎯 Classification Results</h3>
-                <div id="predictionList"></div>
-                <div style="margin-top: 20px; padding: 15px; background: #e8f5e9; border-radius: 10px; text-align: center;">
-                    <p style="color: #006B3F;">⚡ Achieved using optimized XGBoost (500 trees, depth=12)</p>
+            <!-- Training Card -->
+            <div class="card">
+                <h2 style="color: #006B3F;">📚 Train Model</h2>
+                <p>Upload labeled images to teach the model</p>
+                
+                {% if session.username %}
+                <div id="trainingArea">
+                    <div id="imageRows"></div>
+                    <button class="btn btn-secondary" onclick="addRow()">+ Add Image</button>
+                    <button class="btn" onclick="trainModel()">🚀 Start Training</button>
                 </div>
+                <div id="trainingResult" style="margin-top: 20px;"></div>
+                {% else %}
+                <p>Please <a href="/login">login</a> to train the model</p>
+                {% endif %}
             </div>
         </div>
-    </div>
-    
-    <div class="footer">
-        <div class="footer-content">
-            <p>© 2026 Getaye Fiseha - MSc Computer Science, Network & Security Stream</p>
-            <p>Addis Ababa University | College of Natural and Computational Sciences</p>
-            <p style="margin-top: 15px; font-size: 14px;">Submitted in partial fulfillment of the requirements for the Degree of Master of Science in Computer Science</p>
+        
+        {% if is_trained %}
+        <div class="classes-list">
+            <h4>📋 Trained Classes:</h4>
+            {% for class in classes %}
+            <span class="class-tag">{{ class }}</span>
+            {% endfor %}
         </div>
+        {% endif %}
     </div>
     
     <script>
-        // Image preview
+        let rowCount = 0;
+        
+        function addRow() {
+            const container = document.getElementById('imageRows');
+            const row = document.createElement('div');
+            row.id = `row_${rowCount}`;
+            row.style.marginBottom = '10px';
+            row.innerHTML = `
+                <input type="file" accept="image/*" style="margin-right: 10px;">
+                <input type="text" id="label_${rowCount}" placeholder="Label (e.g., cat, dog, flower)" style="padding: 5px;">
+                <button onclick="removeRow(${rowCount})" style="background: #dc3545; color: white; border: none; padding: 5px 10px;">✕</button>
+            `;
+            container.appendChild(row);
+            rowCount++;
+        }
+        
+        function removeRow(id) {
+            const row = document.getElementById(`row_${id}`);
+            if (row) row.remove();
+        }
+        
         document.getElementById('fileInput').addEventListener('change', function(e) {
             const file = e.target.files[0];
             if (file) {
                 const reader = new FileReader();
                 reader.onload = function(e) {
-                    const preview = document.getElementById('preview');
-                    preview.src = e.target.result;
-                    preview.style.display = 'block';
+                    document.getElementById('preview').src = e.target.result;
+                    document.getElementById('preview').style.display = 'block';
                 }
                 reader.readAsDataURL(file);
             }
         });
-
-        // Drag and drop
-        const uploadArea = document.querySelector('.upload-area');
         
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadArea.style.borderColor = '#FCD116';
-            uploadArea.style.backgroundColor = '#fff9e6';
-        });
-
-        uploadArea.addEventListener('dragleave', (e) => {
-            e.preventDefault();
-            uploadArea.style.borderColor = '#006B3F';
-            uploadArea.style.backgroundColor = 'linear-gradient(135deg, #fff, #f8f9fa)';
-        });
-
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.style.borderColor = '#006B3F';
-            uploadArea.style.backgroundColor = 'linear-gradient(135deg, #fff, #f8f9fa)';
-            
-            const file = e.dataTransfer.files[0];
-            if (file && file.type.startsWith('image/')) {
-                document.getElementById('fileInput').files = e.dataTransfer.files;
-                
-                const reader = new FileReader();
-                reader.onload = function(e) {
-                    const preview = document.getElementById('preview');
-                    preview.src = e.target.result;
-                    preview.style.display = 'block';
-                }
-                reader.readAsDataURL(file);
-            }
-        });
-
         async function classifyImage() {
             const fileInput = document.getElementById('fileInput');
             if (!fileInput.files[0]) {
-                alert('Please select an image first');
+                alert('Please select an image');
                 return;
             }
             
             const formData = new FormData();
             formData.append('file', fileInput.files[0]);
             
-            // Show loading
-            const btn = document.getElementById('classifyBtn');
-            const spinner = document.getElementById('spinner');
-            btn.disabled = true;
-            spinner.style.display = 'block';
+            const resultsDiv = document.getElementById('results');
+            resultsDiv.innerHTML = '⏳ Classifying...';
             
             try {
                 const response = await fetch('/predict', {
@@ -826,44 +798,109 @@ INDEX_HTML = """
                 const data = await response.json();
                 
                 if (data.success) {
-                    // Display results
-                    const resultsDiv = document.getElementById('results');
-                    const predictionList = document.getElementById('predictionList');
-                    
-                    predictionList.innerHTML = '';
-                    
-                    data.predictions.forEach((pred, index) => {
-                        const item = document.createElement('div');
-                        item.className = `prediction-item ${index === 0 ? 'top-prediction' : ''}`;
-                        
-                        item.innerHTML = `
-                            <span class="prediction-class">${index === 0 ? '🏆 ' : ''}${pred.class}</span>
-                            <span class="prediction-prob">${pred.probability}</span>
+                    let html = '<h3>Results:</h3>';
+                    data.predictions.forEach((pred, i) => {
+                        const bgClass = i === 0 ? 'top-prediction' : '';
+                        html += `
+                            <div class="prediction-item ${bgClass}">
+                                <span><strong>${i === 0 ? '🏆 ' : ''}${pred.class}</strong></span>
+                                <span style="background: #006B3F; color: white; padding: 5px 15px; border-radius: 20px;">${pred.probability}</span>
+                            </div>
                         `;
-                        
-                        predictionList.appendChild(item);
                     });
-                    
-                    resultsDiv.style.display = 'block';
-                    
-                    // Scroll to results
-                    resultsDiv.scrollIntoView({ behavior: 'smooth' });
+                    resultsDiv.innerHTML = html;
                 } else {
-                    alert('Error: ' + data.error);
+                    resultsDiv.innerHTML = `❌ Error: ${data.error}`;
                 }
             } catch (error) {
-                alert('Error: ' + error.message);
-            } finally {
-                btn.disabled = false;
-                spinner.style.display = 'none';
+                resultsDiv.innerHTML = `❌ Error: ${error.message}`;
             }
         }
+        
+        async function trainModel() {
+            const formData = new FormData();
+            const rows = document.querySelectorAll('[id^="row_"]');
+            
+            for (let row of rows) {
+                const fileInput = row.querySelector('input[type="file"]');
+                const labelInput = row.querySelector('input[type="text"]');
+                
+                if (fileInput.files[0] && labelInput.value) {
+                    formData.append('images', fileInput.files[0]);
+                    formData.append('labels', labelInput.value);
+                }
+            }
+            
+            const resultDiv = document.getElementById('trainingResult');
+            resultDiv.innerHTML = '⏳ Training...';
+            
+            try {
+                const response = await fetch('/train', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                if (data.success) {
+                    resultDiv.innerHTML = `
+                        <div style="background: #d4edda; color: #155724; padding: 15px; border-radius: 10px;">
+                            <strong>✅ Training Complete!</strong><br>
+                            Training Accuracy: ${(data.metrics.train_accuracy * 100).toFixed(2)}%<br>
+                            Validation Accuracy: ${(data.metrics.val_accuracy * 100).toFixed(2)}%<br>
+                            Classes: ${data.metrics.classes.join(', ')}
+                        </div>
+                    `;
+                    setTimeout(() => location.reload(), 2000);
+                } else {
+                    resultDiv.innerHTML = `<div style="background: #f8d7da; color: #721c24; padding: 15px;">❌ Error: ${data.error}</div>`;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `<div style="background: #f8d7da; color: #721c24; padding: 15px;">❌ Error: ${error.message}</div>`;
+            }
+        }
+        
+        // Add initial row
+        {% if session.username %}
+        addRow();
+        {% endif %}
     </script>
 </body>
 </html>
 """
 
-# Simple profile page
+TRAIN_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>AAU - Train Classifier | Getaye Fiseha</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; }
+        .container { max-width: 800px; margin: 40px auto; padding: 20px; }
+        .card { background: white; border-radius: 15px; padding: 30px; box-shadow: 0 5px 20px rgba(0,0,0,0.1); }
+        .btn { background: linear-gradient(135deg, #006B3F, #FCD116); color: white; border: none; 
+               padding: 12px 24px; border-radius: 5px; cursor: pointer; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card">
+            <h2 style="color: #006B3F;">📚 Train Image Classifier</h2>
+            <p>Upload labeled images to teach the model to recognize:</p>
+            <ul>
+                <li>🐱 Animals (cat, dog, elephant, etc.)</li>
+                <li>🌿 Plants (flower, tree, etc.)</li>
+                <li>📦 Objects (car, book, phone, etc.)</li>
+                <li>👥 People</li>
+                <li>🌍 Anything you want!</li>
+            </ul>
+            <a href="/" class="btn">← Back to Classifier</a>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
 PROFILE_HTML = """
 <!DOCTYPE html>
 <html>
@@ -873,39 +910,19 @@ PROFILE_HTML = """
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f5f5f5; }
         .container { max-width: 600px; margin: 40px auto; padding: 20px; }
         .card { background: white; border-radius: 15px; padding: 30px; box-shadow: 0 5px 20px rgba(0,0,0,0.1); }
-        .profile-header { text-align: center; margin-bottom: 30px; }
-        .profile-header h2 { color: #006B3F; }
         .info-item { padding: 15px; background: #f8f9fa; margin: 10px 0; border-radius: 8px; 
                     border-left: 4px solid #FCD116; }
-        .info-item strong { color: #006B3F; display: inline-block; width: 120px; }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="card">
-            <div class="profile-header">
-                <h2>🎓 Student Profile</h2>
-                <p>Addis Ababa University - MSc Computer Science</p>
-            </div>
-            
-            <div class="info-item">
-                <strong>Name:</strong> {{ session.full_name }}
-            </div>
-            <div class="info-item">
-                <strong>ID:</strong> {{ session.student_id }}
-            </div>
-            <div class="info-item">
-                <strong>Email:</strong> {{ session.email }}
-            </div>
-            <div class="info-item">
-                <strong>Role:</strong> {{ session.role }}
-            </div>
-            <div class="info-item">
-                <strong>Program:</strong> MSc Computer Science
-            </div>
-            <div class="info-item">
-                <strong>Stream:</strong> Network & Security
-            </div>
+            <h2 style="color: #006B3F;">🎓 Student Profile</h2>
+            <div class="info-item"><strong>Name:</strong> {{ session.full_name }}</div>
+            <div class="info-item"><strong>ID:</strong> {{ session.student_id }}</div>
+            <div class="info-item"><strong>Email:</strong> {{ session.email }}</div>
+            <div class="info-item"><strong>Role:</strong> {{ session.role }}</div>
+            <a href="/" style="display: inline-block; margin-top: 20px;">← Back</a>
         </div>
     </div>
 </body>
@@ -916,64 +933,45 @@ LOGIN_HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-    <title>AAU - Login | MSc Project</title>
+    <title>AAU - Login</title>
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
         body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
                background: linear-gradient(135deg, #006B3F 0%, #FCD116 100%); 
                min-height: 100vh; display: flex; align-items: center; justify-content: center; }
         .login-container { background: white; padding: 40px; border-radius: 15px; 
                           box-shadow: 0 20px 60px rgba(0,0,0,0.3); width: 100%; max-width: 400px; }
-        .aau-header { text-align: center; margin-bottom: 30px; }
-        .aau-header h1 { color: #006B3F; font-size: 24px; }
+        .aau-header { text-align: center; margin-bottom: 30px; color: #006B3F; }
         .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; margin-bottom: 5px; color: #006B3F; font-weight: 600; }
         .form-group input { width: 100%; padding: 12px; border: 2px solid #e1e1e1; 
-                           border-radius: 8px; font-size: 16px; }
+                           border-radius: 8px; }
         .btn { width: 100%; padding: 14px; background: linear-gradient(135deg, #006B3F 0%, #FCD116 100%); 
-               color: white; border: none; border-radius: 8px; font-size: 18px; font-weight: 600; 
-               cursor: pointer; }
-        .error { background: #fee; color: #c33; padding: 12px; border-radius: 8px; margin-bottom: 20px; }
-        .info { text-align: center; margin-top: 20px; color: #666; }
-        .info p { margin: 5px 0; }
+               color: white; border: none; border-radius: 8px; cursor: pointer; }
+        .info { text-align: center; margin-top: 20px; }
     </style>
 </head>
 <body>
     <div class="login-container">
         <div class="aau-header">
-            <h1>🎓 ADDIS ABABA UNIVERSITY</h1>
-            <p style="color: #666;">MSc Computer Science</p>
+            <h2>🎓 ADDIS ABABA UNIVERSITY</h2>
+            <p>MSc Computer Science</p>
         </div>
-        
-        {% if error %}
-        <div class="error">{{ error }}</div>
-        {% endif %}
-        
+        {% if error %}<div style="color: red; margin-bottom: 20px;">{{ error }}</div>{% endif %}
         <form method="POST">
             <div class="form-group">
-                <label>Username</label>
-                <input type="text" name="username" required>
+                <input type="text" name="username" placeholder="Username" required>
             </div>
             <div class="form-group">
-                <label>Password</label>
-                <input type="password" name="password" required>
+                <input type="password" name="password" placeholder="Password" required>
             </div>
             <button type="submit" class="btn">Login</button>
         </form>
-        
         <div class="info">
             <p>Demo: getaye / Getaye@6132</p>
-            <p>Guest: guest / Guest@2026</p>
         </div>
     </div>
 </body>
 </html>
 """
-
-@app.route('/profile')
-@login_required
-def profile():
-    return render_template_string(PROFILE_HTML, session=session)
 
 # ============================================================================
 # Main Entry Point
